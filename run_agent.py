@@ -71,6 +71,15 @@ from tools.browser_tool import cleanup_browser
 import requests
 
 from hermes_constants import OPENROUTER_BASE_URL, OPENROUTER_MODELS_URL
+from agent.context_anchors import (
+    parse_anchor_config,
+    get_max_total_chars as get_anchors_max_total,
+    is_auto_save_enabled as anchors_auto_save_enabled,
+    load_all_anchors,
+    get_anchor_paths_for_summary,
+    detect_active_anchors,
+    build_anchor_save_prompt,
+)
 
 # Agent internals extracted to agent/ package for modularity
 from agent.prompt_builder import (
@@ -863,6 +872,11 @@ class AIAgent:
         self._user_profile_enabled = False
         self._memory_nudge_interval = 10
         self._memory_flush_min_turns = 6
+
+        # Context anchors: persistent project memory that survives compression
+        self._context_anchors = parse_anchor_config(self.config)
+        self._anchors_max_total = get_anchors_max_total(self.config)
+        self._anchors_auto_save = anchors_auto_save_enabled(self.config)
         self._turns_since_memory = 0
         self._iters_since_skill = 0
         if not skip_memory:
@@ -993,6 +1007,7 @@ class AIAgent:
             base_url=self.base_url,
             api_key=getattr(self, "api_key", ""),
             config_context_length=_config_context_length,
+            anchor_paths=get_anchor_paths_for_summary(self._context_anchors),
         )
         self.compression_enabled = compression_enabled
         self._user_turn_count = 0
@@ -4219,6 +4234,97 @@ class AIAgent:
             if messages and messages[-1].get("_flush_sentinel") == _sentinel:
                 messages.pop()
 
+    def _flush_anchor_state(self, messages: list):
+        """Auto-save project state to relevant anchor files before compression.
+
+        Detects which project(s) the recent conversation relates to via keyword
+        matching, then asks the model to update the corresponding anchor file(s)
+        with current state.
+
+        Uses the same pattern as flush_memories(): inject a prompt, make one
+        API call with read_file + patch tools, execute tool calls, then strip
+        all flush artifacts.
+        """
+        if not self._context_anchors:
+            return
+
+        active = detect_active_anchors(self._context_anchors, messages)
+        if not active:
+            return
+
+        from agent.auxiliary_client import call_llm as _call_llm
+
+        for anchor in active:
+            flush_content = build_anchor_save_prompt(anchor)
+            _sentinel = f"__anchor_flush_{id(self)}_{time.monotonic()}"
+            flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
+            messages.append(flush_msg)
+
+            try:
+                # Build minimal tool set: read_file + patch only
+                anchor_tools = []
+                for t in (self.tools or []):
+                    fname = t.get("function", {}).get("name", "")
+                    if fname in ("read_file", "patch"):
+                        anchor_tools.append(t)
+
+                if not anchor_tools:
+                    messages.pop()
+                    continue
+
+                api_messages = []
+                for msg in messages:
+                    api_msg = msg.copy()
+                    api_msg.pop("reasoning", None)
+                    api_msg.pop("finish_reason", None)
+                    api_msg.pop("_flush_sentinel", None)
+                    api_messages.append(api_msg)
+
+                if self._cached_system_prompt:
+                    api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
+
+                try:
+                    response = _call_llm(
+                        task="anchor_flush",
+                        messages=api_messages,
+                        tools=anchor_tools,
+                        temperature=0.3,
+                        max_tokens=4096,
+                        timeout=30.0,
+                    )
+                except (RuntimeError, Exception) as e:
+                    logger.debug("Anchor flush LLM call failed for %s: %s", anchor["path"], e)
+                    continue
+
+                # Execute tool calls from the response
+                tool_calls = []
+                if hasattr(response, "choices") and response.choices:
+                    assistant_message = response.choices[0].message
+                    if assistant_message.tool_calls:
+                        tool_calls = assistant_message.tool_calls
+
+                for tc in tool_calls:
+                    fname = tc.function.name
+                    if fname in ("read_file", "patch"):
+                        try:
+                            args = json.loads(tc.function.arguments)
+                            handle_function_call(fname, args)
+                            if not self.quiet_mode:
+                                print(f"  📌 Anchor flush: {fname} on {anchor['path']}")
+                        except Exception as e:
+                            logger.debug("Anchor flush tool call failed: %s", e)
+
+            except Exception as e:
+                logger.debug("Anchor flush failed for %s: %s", anchor["path"], e)
+            finally:
+                # Strip flush artifacts
+                while messages and messages[-1].get("_flush_sentinel") != _sentinel:
+                    messages.pop()
+                    if not messages:
+                        break
+                if messages and messages[-1].get("_flush_sentinel") == _sentinel:
+                    messages.pop()
+
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default") -> tuple:
         """Compress conversation context and split the session in SQLite.
 
@@ -4227,6 +4333,10 @@ class AIAgent:
         """
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
+
+        # Pre-compression anchor save: update project context files before they're lost
+        if self._context_anchors and self._anchors_auto_save:
+            self._flush_anchor_state(messages)
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
@@ -4252,6 +4362,22 @@ class AIAgent:
                 )})
         except Exception:
             pass  # Don't break compression if file tracking fails
+
+        # Re-inject context anchors: persistent project state that must survive
+        if self._context_anchors:
+            try:
+                anchor_content = load_all_anchors(
+                    self._context_anchors, self._anchors_max_total
+                )
+                if anchor_content:
+                    compressed.append({"role": "user", "content": anchor_content})
+                    if not self.quiet_mode:
+                        logger.info(
+                            "Context anchors: injected %d anchor(s) after compression",
+                            len(self._context_anchors),
+                        )
+            except Exception as e:
+                logger.debug("Context anchor injection failed: %s", e)
 
         self._invalidate_system_prompt()
         new_system_prompt = self._build_system_prompt(system_message)
