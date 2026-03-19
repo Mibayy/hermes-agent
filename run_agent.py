@@ -78,7 +78,7 @@ from agent.context_anchors import (
     load_all_anchors,
     get_anchor_paths_for_summary,
     detect_active_anchors,
-    build_anchor_save_prompt,
+    build_batch_anchor_save_prompt,
 )
 
 # Agent internals extracted to agent/ package for modularity
@@ -4237,41 +4237,48 @@ class AIAgent:
     def _flush_anchor_state(self, messages: list):
         """Auto-save project state to relevant anchor files before compression.
 
-        Detects which project(s) the recent conversation relates to via keyword
-        matching, then asks the model to update the corresponding anchor file(s)
-        with current state.
-
-        Uses the same pattern as flush_memories(): inject a prompt, make one
-        API call with read_file + patch tools, execute tool calls, then strip
-        all flush artifacts.
+        Batch + multi-round design:
+        - ONE prompt for ALL active anchors (not one per anchor)
+        - Round 1: model emits read_file calls -> we execute -> feed results back
+        - Round 2: model emits patch calls -> we execute
+        - Max 3 rounds to be safe
         """
         if not self._context_anchors:
             return
 
-        active = detect_active_anchors(self._context_anchors, messages)
-        if not active:
+        self._active_anchors = detect_active_anchors(self._context_anchors, messages)
+        if not self._active_anchors:
             return
 
         from agent.auxiliary_client import call_llm as _call_llm
 
-        for anchor in active:
-            flush_content = build_anchor_save_prompt(anchor)
-            _sentinel = f"__anchor_flush_{id(self)}_{time.monotonic()}"
-            flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
-            messages.append(flush_msg)
+        # Build minimal tool set: read_file + patch only
+        anchor_tools = []
+        for t in (self.tools or []):
+            fname = t.get("function", {}).get("name", "")
+            if fname in ("read_file", "patch"):
+                anchor_tools.append(t)
 
-            try:
-                # Build minimal tool set: read_file + patch only
-                anchor_tools = []
-                for t in (self.tools or []):
-                    fname = t.get("function", {}).get("name", "")
-                    if fname in ("read_file", "patch"):
-                        anchor_tools.append(t)
+        if not anchor_tools:
+            return
 
-                if not anchor_tools:
-                    messages.pop()
-                    continue
+        # Allowed paths: only the anchor files themselves
+        allowed_paths = {a["path"] for a in self._active_anchors}
 
+        # Single prompt for all active anchors
+        flush_content = build_batch_anchor_save_prompt(self._active_anchors)
+        _sentinel = f"__anchor_flush_{id(self)}_{time.monotonic()}"
+        flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
+        messages.append(flush_msg)
+        flush_start_idx = len(messages) - 1
+
+        try:
+            # Multi-round loop: read -> patch -> done
+            max_rounds = 3
+            flush_messages = []  # local conversation for the flush
+
+            for round_num in range(max_rounds):
+                # Build API messages from main conversation + flush messages
                 api_messages = []
                 for msg in messages:
                     api_msg = msg.copy()
@@ -4279,6 +4286,8 @@ class AIAgent:
                     api_msg.pop("finish_reason", None)
                     api_msg.pop("_flush_sentinel", None)
                     api_messages.append(api_msg)
+                # Append flush-local messages (tool results from previous rounds)
+                api_messages.extend(flush_messages)
 
                 if self._cached_system_prompt:
                     api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
@@ -4293,37 +4302,77 @@ class AIAgent:
                         timeout=30.0,
                     )
                 except (RuntimeError, Exception) as e:
-                    logger.debug("Anchor flush LLM call failed for %s: %s", anchor["path"], e)
-                    continue
+                    logger.debug("Anchor flush LLM call failed (round %d): %s", round_num, e)
+                    break
 
-                # Execute tool calls from the response
+                # Extract tool calls
                 tool_calls = []
                 if hasattr(response, "choices") and response.choices:
-                    assistant_message = response.choices[0].message
-                    if assistant_message.tool_calls:
-                        tool_calls = assistant_message.tool_calls
+                    assistant_msg = response.choices[0].message
+                    if assistant_msg.tool_calls:
+                        tool_calls = assistant_msg.tool_calls
+                        # Add assistant message to flush conversation
+                        flush_messages.append({
+                            "role": "assistant",
+                            "content": assistant_msg.content or "",
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for tc in tool_calls
+                            ],
+                        })
 
+                if not tool_calls:
+                    # Model is done (no more tool calls)
+                    break
+
+                # Execute tool calls and collect results
                 for tc in tool_calls:
                     fname = tc.function.name
-                    if fname in ("read_file", "patch"):
-                        try:
-                            args = json.loads(tc.function.arguments)
-                            handle_function_call(fname, args)
-                            if not self.quiet_mode:
-                                print(f"  📌 Anchor flush: {fname} on {anchor['path']}")
-                        except Exception as e:
-                            logger.debug("Anchor flush tool call failed: %s", e)
+                    if fname not in ("read_file", "patch"):
+                        flush_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": "Error: only read_file and patch are allowed.",
+                        })
+                        continue
 
-            except Exception as e:
-                logger.debug("Anchor flush failed for %s: %s", anchor["path"], e)
-            finally:
-                # Strip flush artifacts
-                while messages and messages[-1].get("_flush_sentinel") != _sentinel:
-                    messages.pop()
-                    if not messages:
-                        break
-                if messages and messages[-1].get("_flush_sentinel") == _sentinel:
-                    messages.pop()
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        # Security: only allow operations on anchor files
+                        target_path = args.get("path", "")
+                        resolved = str(Path(target_path).resolve()) if target_path else ""
+                        if resolved not in allowed_paths:
+                            result = f"Error: access denied. Only anchor files can be modified: {', '.join(allowed_paths)}"
+                        else:
+                            result = handle_function_call(fname, args)
+                            if not self.quiet_mode:
+                                print(f"  📌 Anchor flush: {fname} on {target_path}")
+                    except Exception as e:
+                        result = f"Error: {e}"
+                        logger.debug("Anchor flush tool call failed: %s", e)
+
+                    flush_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": str(result) if result else "OK",
+                    })
+
+        except Exception as e:
+            logger.debug("Anchor flush failed: %s", e)
+        finally:
+            # Strip ALL flush artifacts from main messages
+            while len(messages) > flush_start_idx:
+                messages.pop()
+            # The flush_msg itself
+            if messages and messages[-1].get("_flush_sentinel") == _sentinel:
+                messages.pop()
 
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default") -> tuple:
         """Compress conversation context and split the session in SQLite.
@@ -4363,18 +4412,21 @@ class AIAgent:
         except Exception:
             pass  # Don't break compression if file tracking fails
 
-        # Re-inject context anchors: persistent project state that must survive
+        # Re-inject context anchors: only those relevant to the conversation
         if self._context_anchors:
             try:
+                active = getattr(self, "_active_anchors", None)
                 anchor_content = load_all_anchors(
-                    self._context_anchors, self._anchors_max_total
+                    self._context_anchors,
+                    max_total=self._anchors_max_total,
+                    only_anchors=active,
                 )
                 if anchor_content:
                     compressed.append({"role": "user", "content": anchor_content})
                     if not self.quiet_mode:
+                        n = len(active) if active else len(self._context_anchors)
                         logger.info(
-                            "Context anchors: injected %d anchor(s) after compression",
-                            len(self._context_anchors),
+                            "Context anchors: injected %d anchor(s) after compression", n,
                         )
             except Exception as e:
                 logger.debug("Context anchor injection failed: %s", e)

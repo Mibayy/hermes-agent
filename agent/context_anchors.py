@@ -124,19 +124,31 @@ def load_anchor_file(anchor: Dict[str, Any]) -> Optional[str]:
     return _truncate_content(content, anchor["max_chars"])
 
 
-def load_all_anchors(anchors: List[Dict[str, Any]], max_total: int) -> Optional[str]:
-    """Load all anchor files and format for injection.
+def load_all_anchors(
+    anchors: List[Dict[str, Any]],
+    max_total: int,
+    only_anchors: List[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Load anchor files and format for injection.
+
+    Args:
+        anchors: All configured anchors.
+        max_total: Max total chars across all loaded anchors.
+        only_anchors: If provided, only load these specific anchors
+                      (selective injection for active projects only).
+                      If None, loads all anchors (backward compat).
 
     Returns a formatted string ready to inject as a user message,
     or None if no anchors have content.
     """
-    if not anchors:
+    target = only_anchors if only_anchors is not None else anchors
+    if not target:
         return None
 
     sections = []
     total_chars = 0
 
-    for anchor in anchors:
+    for anchor in target:
         content = load_anchor_file(anchor)
         if not content:
             continue
@@ -227,26 +239,36 @@ def detect_active_anchors(
 
 
 def build_anchor_save_prompt(anchor: Dict[str, Any]) -> str:
-    """Build the flush prompt for auto-saving project state to an anchor file.
+    """Build the flush prompt for a single anchor (legacy, used by tests)."""
+    return build_batch_anchor_save_prompt([anchor])
 
-    Returns a system-style instruction for the model to update the anchor.
+
+def build_batch_anchor_save_prompt(anchors: List[Dict[str, Any]]) -> str:
+    """Build a single flush prompt for ALL active anchors.
+
+    One LLM call reads and patches all relevant anchor files.
+    The model should emit read_file calls first, then patch calls
+    in subsequent rounds.
     """
-    path = anchor["path"]
-    keywords = ", ".join(anchor["keywords"])
+    file_list = "\n".join(
+        f"  - {a['path']} (keywords: {', '.join(a['keywords'])})"
+        for a in anchors
+    )
 
     return (
-        f"[System: You've been working on a project associated with {path} "
-        f"(keywords: {keywords}). Before context is compressed, update that file "
-        f"to reflect the current state of the project.\n"
+        f"[System: Before context is compressed, update these project context files "
+        f"to reflect current state:\n"
+        f"{file_list}\n"
         f"\n"
-        f"RULES for updating the anchor file:\n"
-        f"1. Read the file first with read_file to understand its structure.\n"
-        f"2. REPLACE outdated info in-place -- do NOT append new lines about "
-        f"something that already has a section. Use patch with the old text.\n"
-        f"3. REMOVE references to fixed bugs, resolved issues, or completed "
-        f"one-time tasks. If something is done, delete it, don't mark it done.\n"
-        f"4. Keep the file organized: clear sections, no duplicates, no stale state.\n"
-        f"5. The file should read as CURRENT TRUTH, not a changelog. "
-        f"A reader should understand the project state without knowing its history.\n"
-        f"6. Be concise and factual. No narrative, no timestamps for resolved work.]"
+        f"PROCEDURE:\n"
+        f"1. Call read_file for EACH file above (emit all read_file calls at once).\n"
+        f"2. After seeing the contents, use patch to update ONLY what changed.\n"
+        f"\n"
+        f"RULES for updating:\n"
+        f"- REPLACE outdated info in-place. Do NOT append to the end.\n"
+        f"- REMOVE fixed bugs, resolved issues, completed one-time tasks entirely.\n"
+        f"- Keep files organized: clear sections, no duplicates, no stale state.\n"
+        f"- Files must read as CURRENT TRUTH, not a changelog.\n"
+        f"- Be concise and factual. No narrative, no timestamps for resolved work.\n"
+        f"- If nothing changed for a file, skip it entirely.]"
     )
