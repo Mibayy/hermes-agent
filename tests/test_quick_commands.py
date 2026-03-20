@@ -171,6 +171,66 @@ class TestGatewayQuickCommands:
         assert "timed out" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_queue_mode_on_toggles_auto_queue(self):
+        from gateway.platforms.base import BasePlatformAdapter
+        import gateway.platforms.base as base_mod
+
+        class _TestAdapter(BasePlatformAdapter):
+            async def connect(self): pass
+            async def disconnect(self): pass
+            async def send(self, *a, **kw): pass
+            async def get_chat_info(self, *a, **kw): return None
+
+        adapter = _TestAdapter.__new__(_TestAdapter)
+        adapter._queue_mode_sessions = set()
+        adapter._active_sessions = {}
+        adapter._pending_messages = {}
+        adapter._background_tasks = set()
+        adapter._message_handler = MagicMock()
+        adapter.platform = MagicMock()
+        adapter.platform.value = "test"
+        adapter.config = MagicMock()
+        adapter.config.extra = {}
+
+        session_key = "test_user"
+        event = self._make_event("queue", "on")
+
+        with patch.object(base_mod, "build_session_key", return_value=session_key):
+            await adapter.handle_message(event)
+
+        assert session_key in adapter._queue_mode_sessions
+
+    @pytest.mark.asyncio
+    async def test_queue_mode_off_removes_auto_queue(self):
+        from gateway.platforms.base import BasePlatformAdapter
+        import gateway.platforms.base as base_mod
+
+        class _TestAdapter(BasePlatformAdapter):
+            async def connect(self): pass
+            async def disconnect(self): pass
+            async def send(self, *a, **kw): pass
+            async def get_chat_info(self, *a, **kw): return None
+
+        adapter = _TestAdapter.__new__(_TestAdapter)
+        adapter._queue_mode_sessions = {"test_user"}
+        adapter._active_sessions = {}
+        adapter._pending_messages = {}
+        adapter._background_tasks = set()
+        adapter._message_handler = MagicMock()
+        adapter.platform = MagicMock()
+        adapter.platform.value = "test"
+        adapter.config = MagicMock()
+        adapter.config.extra = {}
+
+        session_key = "test_user"
+        event = self._make_event("queue", "off")
+
+        with patch.object(base_mod, "build_session_key", return_value=session_key):
+            await adapter.handle_message(event)
+
+        assert session_key not in adapter._queue_mode_sessions
+
+    @pytest.mark.asyncio
     async def test_gateway_config_object_supports_quick_commands(self):
         from gateway.config import GatewayConfig
         from gateway.run import GatewayRunner
