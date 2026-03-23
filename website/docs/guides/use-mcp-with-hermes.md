@@ -395,9 +395,33 @@ enabled: false
 
 That keeps the config around but prevents connection and registration.
 
+## Built-in MCP servers
+
+### hermes-memory: structured agent memory
+
+hermes-memory gives the agent persistent, searchable memory that survives context
+compression. Facts are stored as typed notation (constraints, decisions, values)
+with automatic lifecycle management.
+
+```bash
+pip install hermes-memory
+```
+
+```yaml
+mcp_servers:
+  hermes-memory:
+    command: "hermes-memory"
+```
+
+Once configured, the agent gets 7 new tools: `memory_write`, `memory_search`,
+`memory_tick`, `memory_status`, `memory_reflect`, `memory_export`, `memory_purge`.
+
+See [hermes-memory integration guide](/docs/hermes-memory-integration) for details.
+
 ## Recommended first MCP setups
 
 Good first servers for most users:
+- **hermes-memory** — structured persistent memory (recommended for all users)
 - filesystem
 - git
 - GitHub
