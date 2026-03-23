@@ -295,6 +295,12 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
         model_short = model_short[:25] + "..."
     ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
     left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
+
+    import os as _os
+    if _os.getenv("HERMES_YOLO_MODE"):
+        left_lines.append(f"[bold red]⚠ FULL ACCESS[/] [dim {dim}]— all approvals bypassed[/]")
+    else:
+        left_lines.append(f"[bold green]✓ RESTRICTED ACCESS[/] [dim {dim}]— dangerous commands require approval[/]")
     left_lines.append(f"[dim {dim}]{cwd}[/]")
     if session_id:
         left_lines.append(f"[dim {session_color}]Session: {session_id}[/]")

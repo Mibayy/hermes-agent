@@ -1349,6 +1349,8 @@ class HermesCLI:
 
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
             parts.append(duration_label)
+            if os.getenv("HERMES_YOLO_MODE"):
+                parts.append("⚠ FULL ACCESS")
             return " │ ".join(parts)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -1404,6 +1406,11 @@ class HermesCLI:
                 ("class:status-bar-dim", " "),
                 (bar_style, percent_label),
             ]
+            if os.getenv("HERMES_YOLO_MODE"):
+                frags.extend([
+                    ("class:status-bar-dim", " │ "),
+                    ("class:status-bar-yolo", "⚠ FULL ACCESS"),
+                ])
             frags.extend([
                 ("class:status-bar-dim", " │ "),
                 ("class:status-bar-dim", duration_label),
@@ -6921,6 +6928,7 @@ class HermesCLI:
             'status-bar-warn': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
             'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
+            'status-bar-yolo': 'bg:#1a1a2e #FF4444 bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges
