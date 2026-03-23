@@ -311,14 +311,14 @@ class TestErrorLoggingExcInfo:
             ),
             caplog.at_level(logging.WARNING, logger="tools.vision_tools"),
         ):
-            # Mock the async_call_llm function to return a mock response
+            # Mock the call_llm function to return a mock response
             mock_response = MagicMock()
             mock_choice = MagicMock()
             mock_choice.message.content = "A test image description"
             mock_response.choices = [mock_choice]
 
             with (
-                patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response),
+                patch("tools.vision_tools.call_llm", return_value=mock_response),
             ):
                 # Make unlink fail to trigger cleanup warning
                 original_unlink = Path.unlink
@@ -408,8 +408,7 @@ class TestTildeExpansion:
                 return_value="data:image/png;base64,abc",
             ),
             patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
+                "tools.vision_tools.call_llm",
                 return_value=mock_response,
             ),
         ):

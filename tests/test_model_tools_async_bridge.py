@@ -224,8 +224,7 @@ class TestVisionDispatchLoopSafety:
 
         with (
             patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
+                "tools.vision_tools.call_llm",
                 return_value=fake_response,
             ),
             patch(
@@ -268,8 +267,7 @@ class TestVisionDispatchLoopSafety:
 
         with (
             patch(
-                "tools.vision_tools.async_call_llm",
-                new_callable=AsyncMock,
+                "tools.vision_tools.call_llm",
                 return_value=fake_response,
             ),
             patch(

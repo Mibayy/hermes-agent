@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
-from agent.auxiliary_client import async_call_llm
+from agent.auxiliary_client import call_llm
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
@@ -318,7 +318,7 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
-        response = await async_call_llm(**call_kwargs)
+        response = call_llm(**call_kwargs)
         
         # Extract the analysis
         analysis = response.choices[0].message.content.strip()
