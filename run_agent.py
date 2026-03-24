@@ -5097,9 +5097,26 @@ class AIAgent:
 
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
-            _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            _is_error_result, _error_suffix = _detect_tool_failure(function_name, function_result)
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+                # Surface memory write failures to the user — especially important in
+                # gateway/IM sessions where the backend TUI log is not visible.
+                # Without this, [full] and [error] failures are silent data loss.
+                if function_name == "memory":
+                    try:
+                        _mem_err_data = json.loads(function_result)
+                        _mem_err_msg = _mem_err_data.get("error", "")
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        _mem_err_msg = ""
+                    if _mem_err_msg:
+                        _notify_suffix = (
+                            "\n\n[AGENT INSTRUCTION — DO NOT SKIP] "
+                            f"The memory write just failed: {_mem_err_msg} "
+                            "You MUST tell the user about this failure inline in your next response. "
+                            "Suggest they run /compress or remove old entries to free space."
+                        )
+                        function_result = function_result.rstrip() + _notify_suffix
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")

@@ -415,12 +415,17 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
             logger.debug("Could not parse terminal result as JSON for exit code check")
         return False, ""
 
-    # Memory-specific: distinguish "full" from real errors
+    # Memory-specific: distinguish "full" from generic write errors
     if tool_name == "memory":
         try:
-            data = json.loads(result)
-            if data.get("success") is False and "exceed the limit" in data.get("error", ""):
-                return True, " [full]"
+            # Strip any injected agent instruction suffix before parsing
+            clean = result.split("\n\n[AGENT INSTRUCTION")[0]
+            data = json.loads(clean)
+            if data.get("success") is False:
+                err = data.get("error", "")
+                if "exceed the limit" in err or "full" in err.lower():
+                    return True, " [full]"
+                return True, " [error]"
         except (json.JSONDecodeError, TypeError, AttributeError):
             logger.debug("Could not parse memory result as JSON for capacity check")
 
