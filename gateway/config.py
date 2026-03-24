@@ -55,6 +55,7 @@ class Platform(Enum):
     EMAIL = "email"
     SMS = "sms"
     DINGTALK = "dingtalk"
+    FEISHU = "feishu"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
 
@@ -262,6 +263,9 @@ class GatewayConfig:
                 connected.append(platform)
             # API Server uses enabled flag only (no token needed)
             elif platform == Platform.API_SERVER:
+                connected.append(platform)
+            # Feishu uses extra dict for config (app_id + app_secret)
+            elif platform == Platform.FEISHU and config.extra.get("app_id"):
                 connected.append(platform)
             # Webhook uses enabled flag only (secrets are per-route)
             elif platform == Platform.WEBHOOK:
@@ -766,6 +770,25 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if api_server_host:
             config.platforms[Platform.API_SERVER].extra["host"] = api_server_host
+
+    # Feishu (Lark)
+    feishu_app_id = os.getenv("FEISHU_APP_ID")
+    feishu_app_secret = os.getenv("FEISHU_APP_SECRET")
+    if feishu_app_id and feishu_app_secret:
+        if Platform.FEISHU not in config.platforms:
+            config.platforms[Platform.FEISHU] = PlatformConfig()
+        config.platforms[Platform.FEISHU].enabled = True
+        config.platforms[Platform.FEISHU].extra.update({
+            "app_id": feishu_app_id,
+            "app_secret": feishu_app_secret,
+        })
+        feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
+        if feishu_home:
+            config.platforms[Platform.FEISHU].home_channel = HomeChannel(
+                platform=Platform.FEISHU,
+                chat_id=feishu_home,
+                name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
+            )
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")

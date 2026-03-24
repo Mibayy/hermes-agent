@@ -41,7 +41,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+15551234567'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'feishu:oc_xxxx'"
             },
             "message": {
                 "type": "string",
@@ -128,6 +128,7 @@ def _handle_send(args):
         "mattermost": Platform.MATTERMOST,
         "homeassistant": Platform.HOMEASSISTANT,
         "dingtalk": Platform.DINGTALK,
+        "feishu": Platform.FEISHU,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
     }
@@ -343,6 +344,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_email(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SMS:
             result = await _send_sms(pconfig.api_key, chat_id, chunk)
+        elif platform == Platform.FEISHU:
+            result = await _send_feishu(pconfig.extra, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -664,6 +667,66 @@ async def _send_sms(auth_token, chat_id, message):
                 return {"success": True, "platform": "sms", "chat_id": chat_id, "message_id": msg_sid}
     except Exception as e:
         return {"error": f"SMS send failed: {e}"}
+
+
+async def _send_feishu(extra, chat_id, message):
+    """Send a single Feishu (Lark) message via the Message API.
+
+    Authenticates with App ID + App Secret to obtain an App Access Token,
+    then sends a plain text message to the specified chat_id.
+    Chunking is handled by _send_to_platform() before this is called.
+    """
+    import json as _json
+
+    try:
+        import httpx as _httpx
+    except ImportError:
+        return {"error": "httpx not installed. Run: pip install httpx"}
+
+    app_id = extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")
+    app_secret = extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")
+    if not app_id or not app_secret:
+        return {"error": "Feishu not configured (FEISHU_APP_ID and FEISHU_APP_SECRET required)"}
+
+    use_lark = extra.get("use_lark") or os.getenv("FEISHU_USE_LARK_DOMAIN", "").lower() in ("true", "1", "yes")
+    api_base = "https://open.larksuite.com/open-apis" if use_lark else "https://open.feishu.cn/open-apis"
+
+    try:
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            # Step 1: get App Access Token
+            token_resp = await client.post(
+                f"{api_base}/auth/v3/app_access_token/internal",
+                json={"app_id": app_id, "app_secret": app_secret},
+            )
+            token_data = token_resp.json()
+            if token_data.get("code") != 0:
+                return {"error": f"Feishu token error: {token_data.get('msg', 'unknown')}"}
+
+            token = token_data["app_access_token"]
+
+            # Step 2: send message
+            payload_content = _json.dumps({"text": message})
+            send_resp = await client.post(
+                f"{api_base}/im/v1/messages",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json={
+                    "receive_id": chat_id,
+                    "msg_type": "text",
+                    "content": payload_content,
+                },
+                params={"receive_id_type": "chat_id"},
+                timeout=15.0,
+            )
+            result = send_resp.json()
+            if result.get("code") == 0:
+                msg_id = result.get("data", {}).get("message_id", "")
+                return {"success": True, "platform": "feishu", "chat_id": chat_id, "message_id": str(msg_id)}
+            return {"error": f"Feishu API error {result.get('code')}: {result.get('msg', '')}"}
+    except Exception as e:
+        return {"error": f"Feishu send failed: {e}"}
 
 
 def _check_send_message():

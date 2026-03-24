@@ -205,6 +205,17 @@ PLATFORM_HINTS = {
         "is preserved for threading. Do not include greetings or sign-offs unless "
         "contextually appropriate."
     ),
+    "dingtalk": (
+        "You are on DingTalk (Ding), an enterprise messaging platform. "
+        "Please do not use markdown as it does not render in all contexts. "
+        "Keep responses concise and professional, suitable for workplace communication."
+    ),
+    "feishu": (
+        "You are on Feishu (Lark), an enterprise collaboration platform widely used in Asia. "
+        "Please do not use markdown as it does not render in plain text messages. "
+        "Keep responses concise and professional, suitable for workplace communication. "
+        "You can send media files: include MEDIA:/absolute/path/to/file in your response."
+    ),
     "cron": (
         "You are running as a scheduled cron job. There is no user present — you "
         "cannot ask questions, request clarification, or wait for follow-up. Execute "
