@@ -11,9 +11,53 @@ Each child gets:
   - Its own task_id (own terminal session, file ops cache)
   - A restricted toolset (configurable, with blocked tools always stripped)
   - A focused system prompt built from the delegated goal + context
+  - Its own iteration budget (isolated from the parent by default)
 
 The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
+
+Iteration Budget Modes
+----------------------
+Controlled by ``delegation.budget_mode`` in config.yaml.
+
+**isolated** (default, recommended)
+    Each subagent gets a fresh IterationBudget seeded from its own
+    ``max_iterations``. The parent's consumed iterations do not affect
+    children at all. ``max_iterations=50`` means exactly 50 turns,
+    regardless of what the parent has used.
+
+    Example — parent used 30 of its 90 turns, spawns 3 subagents with
+    max_iterations=50:
+
+        Parent:     30/90 consumed (60 remaining, but irrelevant)
+        Subagent 1:  0/50  fresh budget → can use all 50
+        Subagent 2:  0/50  fresh budget → can use all 50
+        Subagent 3:  0/50  fresh budget → can use all 50
+
+    Each subagent is cut off only by its own cap, not by its siblings or
+    the parent. This is the correct behaviour in almost all cases.
+
+**shared** (legacy, not recommended)
+    All subagents share the parent's partially-consumed IterationBudget.
+    Children are silently capped by the parent's *remaining* turns, not
+    by their own ``max_iterations``. This was the original (buggy)
+    behaviour and is retained only for backwards compatibility.
+
+    Same example with shared mode:
+
+        Parent:     30/90 consumed → 60 remaining, shared by all children
+        Subagent 1: races for a slice of 60
+        Subagent 2: races for a slice of 60   ← each gets ~20 on average
+        Subagent 3: races for a slice of 60
+
+    With 3 parallel subagents that each need 50 turns, the first to
+    exhaust the 60 causes the others to be cut short mid-task.
+
+Configure in ~/.hermes/config.yaml::
+
+    delegation:
+      max_iterations: 50        # turns per subagent (isolated budget)
+      budget_mode: isolated     # "isolated" (default) or "shared"
 """
 
 import json
@@ -38,6 +82,10 @@ MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+
+# Budget mode constants
+BUDGET_MODE_ISOLATED = "isolated"  # each child gets a fresh budget (default, recommended)
+BUDGET_MODE_SHARED = "shared"      # legacy: children share the parent's depleted budget
 
 
 def check_delegate_requirements() -> bool:
@@ -191,9 +239,30 @@ def _build_child_agent(
     # Build progress callback to relay tool calls to parent display
     child_progress_cb = _build_child_progress_callback(task_index, parent_agent)
 
-    # Share the parent's iteration budget so subagent tool calls
-    # count toward the session-wide limit.
-    shared_budget = getattr(parent_agent, "iteration_budget", None)
+    # Determine iteration budget for this child based on budget_mode.
+    #
+    # ISOLATED (default): child gets a brand-new IterationBudget(max_iterations).
+    #   max_iterations=50 means exactly 50 turns for this child, no matter how
+    #   many turns the parent has already consumed.  3 parallel children with
+    #   max_iterations=50 each get 50 turns independently — they do not race.
+    #
+    # SHARED (legacy): child inherits the parent's partially-consumed budget.
+    #   If the parent used 40 of 90 turns before delegating, only 50 remain
+    #   for all children combined.  3 parallel children get ~16 each on average,
+    #   silently hitting the cap mid-task.  Retained for backwards compatibility.
+    #
+    # Load budget_mode from config (falls back to isolated if absent).
+    _cfg = _load_config()
+    budget_mode = str(_cfg.get("budget_mode") or BUDGET_MODE_ISOLATED).strip().lower()
+
+    if budget_mode == BUDGET_MODE_SHARED:
+        # Legacy behaviour: share the parent's IterationBudget object.
+        # Children are capped by whatever turns the parent has left.
+        shared_budget = getattr(parent_agent, "iteration_budget", None)
+    else:
+        # Isolated (default): pass None so AIAgent.__init__ creates a fresh
+        # IterationBudget(max_iterations) that starts at 0 consumed.
+        shared_budget = None
 
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model

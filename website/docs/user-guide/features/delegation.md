@@ -173,6 +173,43 @@ delegate_task(
 )
 ```
 
+### Iteration Budget Modes
+
+Controlled by `delegation.budget_mode` in `config.yaml` (default: `isolated`).
+
+#### `isolated` (default, recommended)
+
+Each subagent gets a **fresh** budget starting at 0. `max_iterations=50` means exactly 50 turns for that child, regardless of how many turns the parent has already consumed or how many siblings are running in parallel.
+
+```
+# Parent used 30 of its 90 turns, then spawns 3 subagents with max_iterations=50
+
+Parent:     ██████████████████████░░░░░░░░░░░░░░░░░░░░  30/90 consumed
+
+Subagent 1: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0/50  ← fresh, uses all 50
+Subagent 2: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0/50  ← fresh, uses all 50
+Subagent 3: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0/50  ← fresh, uses all 50
+```
+
+Each subagent is cut off only by **its own cap**, not by its siblings or what the parent consumed.
+
+#### `shared` (legacy)
+
+All subagents share the parent's **already partially consumed** budget. If the parent used 30 of 90 turns before delegating, only 60 remain for all children combined. With 3 parallel subagents each requesting 50 turns, they race to consume those 60 — each gets roughly 20 on average and is cut short mid-task.
+
+```
+# Same scenario with budget_mode: shared
+
+Parent:     ██████████████████████░░░░░░░░░░░░░░░░░░░░  30/90 consumed
+                                  └── only 60 turns left, shared by all children
+
+Subagent 1: uses ~20 → hits shared cap mid-task  ✗
+Subagent 2: uses ~20 → hits shared cap mid-task  ✗
+Subagent 3: uses ~20 → hits shared cap mid-task  ✗
+```
+
+This was the original (buggy) behaviour. It is retained under `budget_mode: shared` for backwards compatibility but not recommended.
+
 ## Depth Limit
 
 Delegation has a **depth limit of 2** — a parent (depth 0) can spawn children (depth 1), but children cannot delegate further. This prevents runaway recursive delegation chains.
@@ -205,17 +242,25 @@ Delegation has a **depth limit of 2** — a parent (depth 0) can spawn children 
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
-  max_iterations: 50                        # Max turns per child (default: 50)
-  default_toolsets: ["terminal", "file", "web"]  # Default toolsets
-  model: "google/gemini-3-flash-preview"             # Optional provider/model override
-  provider: "openrouter"                             # Optional built-in provider
+  max_iterations: 50          # Max turns per subagent (default: 50)
+  budget_mode: isolated       # "isolated" (default) or "shared" (legacy)
+  default_toolsets: ["terminal", "file", "web"]
+  model: "google/gemini-3-flash-preview"   # Optional: cheaper model for subagents
+  provider: "openrouter"                   # Optional: different provider for subagents
 
-# Or use a direct custom endpoint instead of provider:
+# Or use a direct custom endpoint:
 delegation:
   model: "qwen2.5-coder"
   base_url: "http://localhost:1234/v1"
   api_key: "local-key"
 ```
+
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| `max_iterations` | integer | `50` | Max tool-calling turns per subagent |
+| `budget_mode` | `isolated` / `shared` | `isolated` | How subagent iteration budgets are allocated (see above) |
+| `model` | model string | parent model | Model to use for subagents |
+| `provider` | provider name | parent provider | Provider to route subagents to |
 
 :::tip
 The agent handles delegation automatically based on the task complexity. You don't need to explicitly ask it to delegate — it will do so when it makes sense.
