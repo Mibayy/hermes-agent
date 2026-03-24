@@ -38,6 +38,7 @@ MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+DEFAULT_MAX_PARALLELISM = MAX_CONCURRENT_CHILDREN  # configurable via config.yaml or env
 
 
 def check_delegate_requirements() -> bool:
@@ -401,6 +402,7 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    max_parallelism: Optional[int] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -429,6 +431,16 @@ def delegate_task(
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
+
+    # Resolve max_parallelism: config.yaml > env var > hardcoded default
+    # Caps how many subagents run concurrently -- useful for rate-limited providers.
+    _env_parallelism = os.getenv("HERMES_MAX_PARALLELISM", "").strip()
+    _cfg_parallelism = cfg.get("max_parallelism")
+    try:
+        effective_max_parallelism = int(max_parallelism or _cfg_parallelism or _env_parallelism or DEFAULT_MAX_PARALLELISM)
+        effective_max_parallelism = max(1, effective_max_parallelism)
+    except (ValueError, TypeError):
+        effective_max_parallelism = DEFAULT_MAX_PARALLELISM
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -500,7 +512,7 @@ def delegate_task(
         completed_count = 0
         spinner_ref = getattr(parent_agent, '_delegate_spinner', None)
 
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
+        with ThreadPoolExecutor(max_workers=effective_max_parallelism) as executor:
             futures = {}
             for i, t, child in children:
                 future = executor.submit(
@@ -764,6 +776,16 @@ DELEGATE_TASK_SCHEMA = {
                     "Only set lower for simple tasks."
                 ),
             },
+            "max_parallelism": {
+                "type": "integer",
+                "description": (
+                    "Max number of subagents running concurrently (default: 3). "
+                    "Set to 1 for sequential execution, 2 for limited parallel. "
+                    "Useful when hitting provider rate limits. "
+                    "Can also be set globally via config.yaml delegation.max_parallelism "
+                    "or the HERMES_MAX_PARALLELISM environment variable."
+                ),
+            },
         },
         "required": [],
     },
@@ -783,6 +805,7 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
+        max_parallelism=args.get("max_parallelism"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",
