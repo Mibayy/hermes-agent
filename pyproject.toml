@@ -82,6 +82,9 @@ all = [
   "hermes-agent[acp]",
   "hermes-agent[voice]",
   "hermes-agent[dingtalk]",
+  # yc-bench is intentionally excluded from [all]: it pulls litellm which has no
+  # prebuilt wheels for constrained environments (Termux, Alpine, older ARM).
+  # Install explicitly with: pip install -e ".[yc-bench]"
 ]
 
 [project.scripts]
