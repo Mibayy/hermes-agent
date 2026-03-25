@@ -177,6 +177,41 @@ class TestMessageStorage:
         messages = db.get_messages("s1")
         assert messages[0]["finish_reason"] == "stop"
 
+    def test_reasoning_persisted_and_restored(self, db):
+        """Reasoning field is stored for assistant messages and restored by
+        get_messages_as_conversation() so the API receives coherent multi-turn
+        history for reasoning models (fix for #2936)."""
+        db.create_session(session_id="s1", source="telegram")
+        db.append_message("s1", role="user", content="create a cron job")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content=None,
+            tool_calls=[{"function": {"name": "cronjob", "arguments": "{}"}, "id": "c1", "type": "function"}],
+            reasoning="I should call the cronjob tool to schedule this.",
+        )
+        db.append_message("s1", role="tool", content='{"job_id": "abc"}', tool_call_id="c1")
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 3
+        # reasoning must be present on the assistant message
+        assistant = conv[1]
+        assert assistant["role"] == "assistant"
+        assert assistant.get("reasoning") == "I should call the cronjob tool to schedule this."
+        # user and tool messages must NOT carry reasoning
+        assert "reasoning" not in conv[0]
+        assert "reasoning" not in conv[2]
+
+    def test_reasoning_not_set_for_non_assistant(self, db):
+        """reasoning is never leaked onto user or tool messages."""
+        db.create_session(session_id="s1", source="telegram")
+        db.append_message("s1", role="user", content="hi")
+        db.append_message("s1", role="assistant", content="hello", reasoning=None)
+
+        conv = db.get_messages_as_conversation("s1")
+        assert "reasoning" not in conv[0]
+        assert "reasoning" not in conv[1]
+
 
 # =========================================================================
 # FTS5 search
@@ -737,7 +772,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 5
+        assert version == 6
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -793,12 +828,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v5
+        # Open with SessionDB — should migrate to v6
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 5
+        assert cursor.fetchone()[0] == 6
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
