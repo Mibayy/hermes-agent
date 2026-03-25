@@ -26,7 +26,7 @@ from typing import Dict, Any, List, Optional
 
 DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_name TEXT,
     timestamp REAL NOT NULL,
     token_count INTEGER,
-    finish_reason TEXT
+    finish_reason TEXT,
+    reasoning TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -189,6 +190,17 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass
                 cursor.execute("UPDATE schema_version SET version = 5")
+            if current_version < 6:
+                # v6: add reasoning column to messages — preserves assistant reasoning
+                # tokens across gateway session turns for Hermes-4 and other reasoning
+                # models. Without this, the reasoning chain is lost on reload and the
+                # API receives an inconsistent history, causing the model to fall back
+                # to text generation instead of tool calls.
+                try:
+                    cursor.execute("ALTER TABLE messages ADD COLUMN reasoning TEXT")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 6")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -587,6 +599,7 @@ class SessionDB:
         tool_call_id: str = None,
         token_count: int = None,
         finish_reason: str = None,
+        reasoning: str = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -597,8 +610,8 @@ class SessionDB:
         with self._lock:
             cursor = self._conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, timestamp, token_count, finish_reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   tool_calls, tool_name, timestamp, token_count, finish_reason, reasoning)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -609,6 +622,7 @@ class SessionDB:
                     time.time(),
                     token_count,
                     finish_reason,
+                    reasoning,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -657,10 +671,16 @@ class SessionDB:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
         Used by the gateway to restore conversation history.
+
+        The ``reasoning`` column is restored on assistant messages so that
+        reasoning-capable models (Hermes-4, DeepSeek-R1, etc.) receive a
+        coherent multi-turn history.  Without it, the API sees assistant
+        messages that called tools with no prior reasoning, which causes the
+        model to fall back to text generation instead of tool calls (#2936).
         """
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name "
+                "SELECT role, content, tool_call_id, tool_calls, tool_name, reasoning "
                 "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
                 (session_id,),
             )
@@ -677,6 +697,10 @@ class SessionDB:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
                     pass
+            # Restore reasoning for assistant messages — used by _build_api_kwargs
+            # to inject reasoning_content into outgoing API payloads.
+            if row["role"] == "assistant" and row["reasoning"]:
+                msg["reasoning"] = row["reasoning"]
             messages.append(msg)
         return messages
 
