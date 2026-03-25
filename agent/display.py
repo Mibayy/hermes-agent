@@ -253,6 +253,27 @@ class KawaiiSpinner:
         except (ValueError, OSError):
             pass
 
+    def _is_patch_stdout_proxy(self) -> bool:
+        """Return True when stdout has been replaced by prompt_toolkit's StdoutProxy.
+
+        patch_stdout wraps sys.stdout in a StdoutProxy that queues writes and
+        calls run_in_terminal() around each flush.  That means every \\r write
+        gets a mandatory newline injected before and after, so the carriage-
+        return overwrite never lands on the correct line — each spinner frame
+        ends up on its own line and collides with the status bar.
+
+        The fix: when we detect the proxy, suppress the \\r-based animation
+        entirely.  The CLI already drives a separate TUI widget (_spinner_text)
+        that displays the same information through prompt_toolkit's own
+        renderer, so there is nothing for KawaiiSpinner to show.
+        """
+        out = self._out
+        # prompt_toolkit's StdoutProxy sets this sentinel attribute.
+        if getattr(out, '_raw', None) is not None:
+            return True
+        # Fallback: check the class name in case the attribute ever changes.
+        return type(out).__name__ == 'StdoutProxy'
+
     def _animate(self):
         # When stdout is not a real terminal (e.g. Docker, systemd, pipe),
         # skip the animation entirely — it creates massive log bloat.
@@ -261,6 +282,17 @@ class KawaiiSpinner:
             self._write(f"  [tool] {self.message}", flush=True)
             while self.running:
                 time.sleep(0.5)
+            return
+
+        # When running inside prompt_toolkit's patch_stdout context the CLI
+        # renders spinner state via a dedicated TUI widget (_spinner_text).
+        # Driving a \r-based animation here too causes visual overdraw: the
+        # StdoutProxy injects newlines around each flush, so every frame lands
+        # on a new line and overwrites the status bar.  Suppress the animation
+        # loop completely — the TUI widget handles it.
+        if self._is_patch_stdout_proxy():
+            while self.running:
+                time.sleep(0.1)
             return
 
         # Cache skin wings at start (avoid per-frame imports)
@@ -279,18 +311,7 @@ class KawaiiSpinner:
             else:
                 line = f"  {frame} {self.message} ({elapsed:.1f}s)"
             pad = max(self.last_line_len - len(line), 0)
-            # Rate-limit flush() calls to avoid spinner spam under
-            # prompt_toolkit's patch_stdout.  Each flush() pushes a queue
-            # item that may trigger a separate run_in_terminal() call; if
-            # items are processed one-at-a-time the \r overwrite is lost
-            # and every frame appears on its own line.  By flushing at
-            # most every 0.4s we guarantee multiple \r-frames are batched
-            # into a single write, so the terminal collapses them correctly.
-            now = time.time()
-            should_flush = (now - self._last_flush_time) >= 0.4
-            self._write(f"\r{line}{' ' * pad}", end='', flush=should_flush)
-            if should_flush:
-                self._last_flush_time = now
+            self._write(f"\r{line}{' ' * pad}", end='', flush=True)
             self.last_line_len = len(line)
             self.frame_idx += 1
             time.sleep(0.12)
