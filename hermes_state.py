@@ -27,7 +27,7 @@ from typing import Dict, Any, List, Optional
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -78,6 +78,11 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning TEXT,
     reasoning_details TEXT,
     codex_reasoning_items TEXT
+);
+
+CREATE TABLE IF NOT EXISTS flushed_sessions (
+    session_id TEXT PRIMARY KEY,
+    flushed_at REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -212,8 +217,18 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: persist proactively-flushed sessions so they survive gateway restarts
+                try:
+                    cursor.execute(
+                        "CREATE TABLE IF NOT EXISTS flushed_sessions ("
+                        "session_id TEXT PRIMARY KEY, flushed_at REAL NOT NULL)"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # Table already exists
+                cursor.execute("UPDATE schema_version SET version = 7")
 
-        # Unique title index — always ensure it exists (safe to run after migrations
+        # Unique title index — always ensure it exists
         # since the title column is guaranteed to exist at this point)
         try:
             cursor.execute(
@@ -1008,3 +1023,30 @@ class SessionDB:
 
             self._conn.commit()
         return len(session_ids)
+
+    # ------------------------------------------------------------------
+    # Flushed-session persistence (prevents double flush after restart)
+    # ------------------------------------------------------------------
+
+    def add_flushed_session(self, session_id: str) -> None:
+        """Record that a session's memories have been proactively flushed."""
+        import time
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO flushed_sessions (session_id, flushed_at) VALUES (?, ?)",
+                (session_id, time.time()),
+            )
+            self._conn.commit()
+
+    def load_flushed_sessions(self) -> set:
+        """Return the set of session_ids that have already been flushed."""
+        cursor = self._conn.execute("SELECT session_id FROM flushed_sessions")
+        return {row[0] for row in cursor.fetchall()}
+
+    def remove_flushed_session(self, session_id: str) -> None:
+        """Remove a session from the flushed set (e.g. after it is fully reset)."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM flushed_sessions WHERE session_id = ?", (session_id,)
+            )
+            self._conn.commit()

@@ -482,12 +482,15 @@ class SessionStore:
         # on_auto_reset is deprecated — memory flush now runs proactively
         # via the background session expiry watcher in GatewayRunner.
         self._pre_flushed_sessions: set = set()  # session_ids already flushed by watcher
-        
+
         # Initialize SQLite session database
         self._db = None
         try:
             from hermes_state import SessionDB
             self._db = SessionDB()
+            # Restore flushed-session set from DB so gateway restarts don't
+            # trigger duplicate memory flushes for already-flushed sessions.
+            self._pre_flushed_sessions = self._db.load_flushed_sessions()
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
     
@@ -692,7 +695,8 @@ class SessionStore:
                     # Track whether the expired session had any real conversation
                     reset_had_activity = entry.total_tokens > 0
                     db_end_session_id = entry.session_id
-                    self._pre_flushed_sessions.discard(entry.session_id)
+                    flushed_session_id = entry.session_id
+                    self._pre_flushed_sessions.discard(flushed_session_id)
             else:
                 was_auto_reset = False
                 auto_reset_reason = None
@@ -729,6 +733,12 @@ class SessionStore:
                 self._db.end_session(db_end_session_id, "session_reset")
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
+            try:
+                # Clean up the flushed-session record so it doesn't accumulate
+                # in the DB indefinitely after the session has been reset.
+                self._db.remove_flushed_session(db_end_session_id)
+            except Exception as e:
+                logger.debug("Failed to remove flushed session record %s: %s", db_end_session_id, e)
 
         if self._db and db_create_kwargs:
             try:

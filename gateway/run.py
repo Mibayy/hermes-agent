@@ -570,8 +570,10 @@ class GatewayRunner:
             # Read live memory state from disk so the flush agent can see
             # what's already saved and avoid overwriting newer entries.
             _current_memory = ""
+            _memory_near_full = False
             try:
                 from tools.memory_tool import MEMORY_DIR
+                MEMORY_LIMITS = {"MEMORY.md": 2200, "USER.md": 1375}
                 for fname, label in [
                     ("MEMORY.md", "MEMORY (your personal notes)"),
                     ("USER.md", "USER PROFILE (who the user is)"),
@@ -581,6 +583,9 @@ class GatewayRunner:
                         content = fpath.read_text(encoding="utf-8").strip()
                         if content:
                             _current_memory += f"\n\n## Current {label}:\n{content}"
+                            limit = MEMORY_LIMITS.get(fname, 2200)
+                            if len(content) >= limit * 0.9:
+                                _memory_near_full = True
             except Exception:
                 pass  # Non-fatal — flush still works, just without the guard
 
@@ -596,6 +601,16 @@ class GatewayRunner:
                 "problem, consider saving it as a skill.\n"
                 "3. If nothing is worth saving, that's fine — just skip.\n\n"
             )
+
+            if _memory_near_full:
+                flush_prompt += (
+                    "WARNING — memory is at or near capacity (>=90% full). "
+                    "Do NOT attempt to add new entries without first removing or "
+                    "consolidating existing ones. Use action='replace' to update "
+                    "stale entries in-place, or action='remove' to delete entries "
+                    "that are now obsolete, before adding anything new. "
+                    "Adding entries when memory is full will fail.\n\n"
+                )
 
             if _current_memory:
                 flush_prompt += (
@@ -1151,6 +1166,12 @@ class GatewayRunner:
                         await self._async_flush_memories(entry.session_id, key)
                         self._shutdown_gateway_honcho(key)
                         self.session_store._pre_flushed_sessions.add(entry.session_id)
+                        # Persist to DB so the marker survives gateway restarts
+                        if self.session_store._db:
+                            try:
+                                self.session_store._db.add_flushed_session(entry.session_id)
+                            except Exception as db_err:
+                                logger.debug("Failed to persist flushed session %s: %s", entry.session_id, db_err)
                     except Exception as e:
                         logger.debug("Proactive memory flush failed for %s: %s", entry.session_id, e)
             except Exception as e:
