@@ -91,6 +91,51 @@ Both can run simultaneously. The memory tool handles "who is the user" and
 "what's the environment". hermes-memory handles "what did we decide about auth"
 and "what are the project constraints".
 
+## Managing MEMORY.md pressure
+
+MEMORY.md is injected into every turn — keeping it compact directly reduces token
+cost. hermes-memory acts as a relief valve: structured facts that accumulate in
+MEMORY.md can be migrated to the DB and replaced with a single `memory_search()`
+call on-demand.
+
+### Compression guidelines
+
+When MEMORY.md approaches its character limit, apply these rules in order:
+
+1. **Abbreviate first** — most entries can be cut 40-60% with standard shorthands:
+   `pr`=pour, `req`=requis, `chg`=changement, `cfg`=config, `dep`=dépendance,
+   `w/`=avec, `→`=vers/puis, `↑`=upgrade, `0`=zéro, drop articles and filler words.
+
+2. **Migrate structured facts** — any C/D/V entry that isn't needed every turn
+   belongs in hermes-memory, not MEMORY.md:
+   ```
+   # Before (in MEMORY.md, ~120 chars):
+   "Database IDs must always be UUID, never autoincrement. Decided in sprint 3."
+
+   # After (migrated to hermes-memory):
+   memory_write("C[db.id]: UUID mndtry, nvr autoincrement")
+   # MEMORY.md entry removed — retrieved with memory_search("db id") when needed
+   ```
+
+3. **Remove duplicates** — facts already in hermes-memory DB don't need to be in
+   MEMORY.md. Keep only the pointer: `memory_search() pour détails projet`.
+
+### Automated pressure relief
+
+A cron job can automate this at scheduled intervals:
+
+```
+# Example cron prompt (runs 2x/day):
+Check MEMORY.md usage via memory_status(). If MEMORY > 55% or USER > 55%:
+- Abbreviate verbose entries
+- Migrate structured C/D/V facts to memory_write()
+- Remove entries already covered in hermes-memory DB
+Target: both stores below 45%.
+If already below threshold, do nothing.
+```
+
+This keeps injection cost stable even across long-running projects.
+
 ## Links
 
 - PyPI: https://pypi.org/project/hermes-memory/
