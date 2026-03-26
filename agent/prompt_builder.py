@@ -207,6 +207,12 @@ PLATFORM_HINTS = {
         "is preserved for threading. Do not include greetings or sign-offs unless "
         "contextually appropriate."
     ),
+    "xmpp": (
+        "You are on XMPP, an open messaging protocol. "
+        "Plain text is preferred — markdown does not render in most XMPP clients. "
+        "Messages can be sent to individual JIDs (user@example.org) or MUC rooms "
+        "(room@conference.example.org). Keep responses concise."
+    ),
     "cron": (
         "You are running as a scheduled cron job. There is no user present — you "
         "cannot ask questions, request clarification, or wait for follow-up. Execute "

@@ -57,6 +57,7 @@ class Platform(Enum):
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
+    XMPP = "xmpp"
 
 
 @dataclass
@@ -273,6 +274,9 @@ class GatewayConfig:
                 connected.append(platform)
             # Webhook uses enabled flag only (secrets are per-route)
             elif platform == Platform.WEBHOOK:
+                connected.append(platform)
+            # XMPP uses extra dict for config (jid + password)
+            elif platform == Platform.XMPP and config.extra.get("jid"):
                 connected.append(platform)
         return connected
     
@@ -802,6 +806,26 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if webhook_secret:
             config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
+
+    # XMPP
+    xmpp_jid = os.getenv("XMPP_JID")
+    xmpp_password = os.getenv("XMPP_PASSWORD")
+    if xmpp_jid and xmpp_password:
+        if Platform.XMPP not in config.platforms:
+            config.platforms[Platform.XMPP] = PlatformConfig()
+        config.platforms[Platform.XMPP].enabled = True
+        config.platforms[Platform.XMPP].extra.update({
+            "jid": xmpp_jid,
+            "password": xmpp_password,
+            "omemo": os.getenv("XMPP_OMEMO", "false").lower() in ("true", "1", "yes"),
+        })
+        xmpp_home = os.getenv("XMPP_HOME_CHANNEL")
+        if xmpp_home:
+            config.platforms[Platform.XMPP].home_channel = HomeChannel(
+                platform=Platform.XMPP,
+                chat_id=xmpp_home,
+                name=os.getenv("XMPP_HOME_CHANNEL_NAME", "Home"),
+            )
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

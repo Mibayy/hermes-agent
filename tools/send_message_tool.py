@@ -5,6 +5,7 @@ Sends a message to a user or channel on any connected messaging platform
 human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -41,7 +42,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+15551234567'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'xmpp:user@example.org'"
             },
             "message": {
                 "type": "string",
@@ -130,6 +131,7 @@ def _handle_send(args):
         "dingtalk": Platform.DINGTALK,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "xmpp": Platform.XMPP,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -343,6 +345,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_email(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SMS:
             result = await _send_sms(pconfig.api_key, chat_id, chunk)
+        elif platform == Platform.XMPP:
+            result = await _send_xmpp(pconfig.extra, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -664,6 +668,57 @@ async def _send_sms(auth_token, chat_id, message):
                 return {"success": True, "platform": "sms", "chat_id": chat_id, "message_id": msg_sid}
     except Exception as e:
         return {"error": f"SMS send failed: {e}"}
+
+
+async def _send_xmpp(extra, chat_id, message):
+    """Send via XMPP using slixmpp (one-shot connection)."""
+    try:
+        import slixmpp
+    except ImportError:
+        return {"error": "slixmpp not installed. Run: pip install slixmpp"}
+
+    jid = extra.get("jid") or os.getenv("XMPP_JID", "")
+    password = extra.get("password") or os.getenv("XMPP_PASSWORD", "")
+    if not jid or not password:
+        return {"error": "XMPP not configured (XMPP_JID and XMPP_PASSWORD required)"}
+
+    sent_event = asyncio.Event()
+    error_holder = {}
+
+    class _OneShotXMPP(slixmpp.ClientXMPP):
+        def __init__(self):
+            super().__init__(jid, password)
+            self.add_event_handler("session_start", self._on_start)
+            self.add_event_handler("failed_auth", self._on_auth_fail)
+
+        async def _on_start(self, event):
+            try:
+                mtype = "groupchat" if ("@conference." in chat_id or "@muc." in chat_id) else "chat"
+                self.send_message(mto=chat_id, mbody=message, mtype=mtype)
+            except Exception as exc:
+                error_holder["error"] = str(exc)
+            finally:
+                self.disconnect()
+                sent_event.set()
+
+        async def _on_auth_fail(self, event):
+            error_holder["error"] = "XMPP authentication failed"
+            self.disconnect()
+            sent_event.set()
+
+    client = _OneShotXMPP()
+    try:
+        client.connect()
+        asyncio.ensure_future(client.process(forever=False))
+        await asyncio.wait_for(sent_event.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        error_holder["error"] = "XMPP send timed out"
+    except Exception as exc:
+        error_holder["error"] = f"XMPP connection failed: {exc}"
+
+    if "error" in error_holder:
+        return {"error": error_holder["error"]}
+    return {"success": True, "platform": "xmpp", "chat_id": chat_id}
 
 
 def _check_send_message():
