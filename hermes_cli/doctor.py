@@ -638,14 +638,21 @@ def run_doctor(args):
         # Add project root to path for imports
         sys.path.insert(0, str(PROJECT_ROOT))
         from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
-        
+        from hermes_cli.tools_config import load_config, _get_platform_tools
+
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
-        
+
+        _cli_enabled = _get_platform_tools(load_config(), "cli")
+
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
-            check_ok(info.get("name", tid))
-        
+            label = info.get("name", tid)
+            if tid in _cli_enabled:
+                check_ok(label)
+            else:
+                check_warn(label, "(requirements met, but disabled — enable with: hermes tools enable " + tid + ")")
+
         for item in unavailable:
             env_vars = item.get("missing_vars") or item.get("env_vars") or []
             if env_vars:
