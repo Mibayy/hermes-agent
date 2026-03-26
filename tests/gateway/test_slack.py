@@ -506,7 +506,7 @@ class TestMessageRouting:
 
     @pytest.mark.asyncio
     async def test_bot_messages_ignored(self, adapter):
-        """Messages from bots should be ignored."""
+        """Messages from bots should be ignored by default (SLACK_ALLOW_BOTS=none)."""
         event = {
             "text": "bot response",
             "bot_id": "B_OTHER",
@@ -516,6 +516,91 @@ class TestMessageRouting:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_all_accepts_other_bot(self, adapter, monkeypatch):
+        """SLACK_ALLOW_BOTS=all should let other bots' messages through."""
+        monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
+        event = {
+            "text": "hello from bot",
+            "bot_id": "B_OTHER",
+            "channel": "C123",
+            "channel_type": "im",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_all_still_ignores_own_messages(self, adapter, monkeypatch):
+        """SLACK_ALLOW_BOTS=all should drop our own bot's messages to prevent echo loops."""
+        monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
+        adapter._bot_id = "B_SELF"
+        event = {
+            "text": "our own message",
+            "bot_id": "B_SELF",
+            "channel": "C123",
+            "channel_type": "im",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_mentions_accepts_when_mentioned(self, adapter, monkeypatch):
+        """SLACK_ALLOW_BOTS=mentions should accept bot messages that @mention us."""
+        monkeypatch.setenv("SLACK_ALLOW_BOTS", "mentions")
+        event = {
+            "text": "<@U_BOT> please summarise this",
+            "bot_id": "B_OTHER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_mentions_ignores_without_mention(self, adapter, monkeypatch):
+        """SLACK_ALLOW_BOTS=mentions should drop bot messages that don't @mention us."""
+        monkeypatch.setenv("SLACK_ALLOW_BOTS", "mentions")
+        event = {
+            "text": "just a bot talking to itself",
+            "bot_id": "B_OTHER",
+            "channel": "C123",
+            "channel_type": "im",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_none_explicit_still_ignores(self, adapter, monkeypatch):
+        """Explicit SLACK_ALLOW_BOTS=none behaves like the default."""
+        monkeypatch.setenv("SLACK_ALLOW_BOTS", "none")
+        event = {
+            "text": "bot chatter",
+            "bot_id": "B_OTHER",
+            "channel": "C123",
+            "channel_type": "im",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_subtype_bot_message(self, adapter, monkeypatch):
+        """SLACK_ALLOW_BOTS=all should also accept bot_message subtype events."""
+        monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
+        event = {
+            "text": "posted by webhook",
+            "subtype": "bot_message",
+            "channel": "C123",
+            "channel_type": "im",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_message_edits_ignored(self, adapter):

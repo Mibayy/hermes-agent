@@ -71,6 +71,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._app: Optional[AsyncApp] = None
         self._handler: Optional[AsyncSocketModeHandler] = None
         self._bot_user_id: Optional[str] = None
+        self._bot_id: Optional[str] = None  # bot_id from auth.test, used for self-message detection
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
 
     async def connect(self) -> bool:
@@ -97,6 +98,7 @@ class SlackAdapter(BasePlatformAdapter):
             # Get our own bot user ID for mention detection
             auth_response = await self._app.client.auth_test()
             self._bot_user_id = auth_response.get("user_id")
+            self._bot_id = auth_response.get("bot_id")
             bot_name = auth_response.get("user", "unknown")
 
             # Register message event handler
@@ -625,9 +627,22 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
-        # Ignore bot messages (including our own)
+        # Bot message filtering (SLACK_ALLOW_BOTS):
+        #   "none"     — ignore all bot messages (default, backward-compatible)
+        #   "mentions" — accept bot messages only when they @mention us
+        #   "all"      — accept all bot messages (except our own)
         if event.get("bot_id") or event.get("subtype") == "bot_message":
-            return
+            allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none").lower().strip()
+            if allow_bots == "none":
+                return
+            elif allow_bots == "mentions":
+                text_check = event.get("text", "")
+                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                    return
+            # "all" falls through to handle_message
+            # Always ignore our own messages to prevent echo loops
+            if self._bot_id and event.get("bot_id") == self._bot_id:
+                return
 
         # Ignore message edits and deletions
         subtype = event.get("subtype")
