@@ -3442,6 +3442,105 @@ class HermesCLI:
         from hermes_cli.skills_hub import handle_skills_slash
         handle_skills_slash(cmd, ChatConsole())
 
+    def _handle_resume_command(self, cmd: str):
+        """Handle /resume [id|title] — switch to a previously-saved CLI session."""
+        if not self._session_db:
+            _cprint("  Session database not available.")
+            return
+
+        parts = cmd.strip().split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if not arg:
+            # No argument — list recent titled sessions
+            try:
+                sessions = self._session_db.list_sessions_rich(source="cli", limit=10)
+            except Exception:
+                sessions = self._session_db.list_sessions_rich(limit=10)
+            titled = [s for s in sessions if s.get("title")]
+            if not titled:
+                _cprint(
+                    "  No named sessions found.\n"
+                    "  Use /title My Session to name the current session, "
+                    "then /resume My Session to return later.\n"
+                    "  You can also resume by ID: /resume 20260101_120000_abcdef"
+                )
+                return
+            _cprint("\n  Named sessions:")
+            for s in titled[:10]:
+                title = s["title"]
+                preview = s.get("preview", "")[:50]
+                preview_part = f"  — {preview}" if preview else ""
+                _cprint(f"    {title}{preview_part}")
+            _cprint("\n  Usage: /resume <session title or ID>")
+            return
+
+        # Resolve: try as session ID first, then as title
+        target_id = None
+        if self._session_db.get_session(arg):
+            target_id = arg
+        else:
+            target_id = self._session_db.resolve_session_by_title(arg)
+
+        if not target_id:
+            _cprint(f"  No session found matching '{arg}'.")
+            _cprint("  Use /resume with no arguments to list available sessions.")
+            return
+
+        if target_id == self.session_id:
+            _cprint(f"  Already on session {target_id}.")
+            return
+
+        # Flush memories for current session before switching
+        if self.agent and self.conversation_history:
+            try:
+                self.agent.flush_memories(self.conversation_history)
+            except Exception:
+                pass
+
+        # End the current session in DB
+        if self._session_db:
+            try:
+                self._session_db.end_session(self.session_id, "resumed_other")
+            except Exception:
+                pass
+
+        # Switch session ID and load history
+        self.session_id = target_id
+        self._resumed = True
+        self.conversation_history = []
+
+        if self.agent:
+            self.agent.session_id = target_id
+            self.agent.reset_session_state()
+            if hasattr(self.agent, "_last_flushed_db_idx"):
+                self.agent._last_flushed_db_idx = 0
+
+        restored = self._session_db.get_messages_as_conversation(target_id)
+        if restored:
+            self.conversation_history = restored
+            if self.agent:
+                self.agent.conversation_history = restored
+            session_meta = self._session_db.get_session(target_id)
+            title_part = f' "{session_meta["title"]}"' if session_meta and session_meta.get("title") else ""
+            msg_count = len([m for m in restored if m.get("role") == "user"])
+            _cprint(
+                f"  Resumed session {target_id}{title_part} "
+                f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
+                f"{len(restored)} total messages)"
+            )
+            # Re-open session in DB (clear ended_at)
+            try:
+                self._session_db._conn.execute(
+                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                    (target_id,),
+                )
+                self._session_db._conn.commit()
+            except Exception:
+                pass
+        else:
+            _cprint(f"  Session {target_id} found but has no messages. Starting fresh.")
+
     def _show_gateway_status(self):
         """Show status of the gateway and connected messaging platforms."""
         from gateway.config import load_gateway_config, Platform
@@ -3647,6 +3746,8 @@ class HermesCLI:
                     _cprint("  Session database not available.")
         elif canonical == "new":
             self.new_session()
+        elif canonical == "resume":
+            self._handle_resume_command(cmd_original)
         elif canonical == "provider":
             self._show_model_and_providers()
         elif canonical == "prompt":

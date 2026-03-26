@@ -893,8 +893,15 @@ class AIAgent:
                     user_id=None,
                 )
             except Exception as e:
-                logger.warning("Session DB create_session failed — messages will NOT be indexed: %s", e)
-                self._session_db = None  # prevent silent data loss on every subsequent flush
+                # A UNIQUE constraint error means the session was already created
+                # by the caller (e.g. CLI creates the row in __init__ before AIAgent
+                # is instantiated).  That is expected — don't discard session_db.
+                err_str = str(e).lower()
+                if "unique" in err_str or "already exists" in err_str:
+                    logger.debug("Session %s already exists in DB — skipping create_session", self.session_id)
+                else:
+                    logger.warning("Session DB create_session failed — messages will NOT be indexed: %s", e)
+                    self._session_db = None  # prevent silent data loss on every subsequent flush
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
