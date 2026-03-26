@@ -3250,6 +3250,15 @@ For more help on a command:
         action="store_true",
         help="Reset configuration to defaults"
     )
+    setup_parser.add_argument(
+        "--local-gpu",
+        action="store_true",
+        dest="local_gpu",
+        help=(
+            "Detect GPU hardware (NVIDIA/AMD/Apple Silicon) and print "
+            "optimal vLLM serve configuration. No interactivity required."
+        ),
+    )
     setup_parser.set_defaults(func=cmd_setup)
 
     # =========================================================================
