@@ -4055,13 +4055,29 @@ class AIAgent:
         if not fb_provider or not fb_model:
             return False
 
+        # Resolve fallback-specific custom endpoint overrides.
+        # base_url and api_key_env are documented in the config reference and
+        # must be forwarded to resolve_provider_client so that a fallback to a
+        # *different* custom endpoint (e.g. a local LM Studio instance when the
+        # primary endpoint is a remote cloud) actually uses that endpoint rather
+        # than re-using the global OPENAI_BASE_URL / OPENAI_API_KEY values.
+        fb_base_url = (fb.get("base_url") or "").strip() or None
+        fb_api_key_env = (fb.get("api_key_env") or "").strip() or None
+        fb_explicit_key: Optional[str] = None
+        if fb_api_key_env:
+            import os as _os
+            fb_explicit_key = _os.getenv(fb_api_key_env, "").strip() or None
+
         # Use centralized router for client construction.
         # raw_codex=True because the main agent needs direct responses.stream()
         # access for Codex providers.
         try:
             from agent.auxiliary_client import resolve_provider_client
             fb_client, _ = resolve_provider_client(
-                fb_provider, model=fb_model, raw_codex=True)
+                fb_provider, model=fb_model, raw_codex=True,
+                explicit_base_url=fb_base_url,
+                explicit_api_key=fb_explicit_key,
+            )
             if fb_client is None:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",

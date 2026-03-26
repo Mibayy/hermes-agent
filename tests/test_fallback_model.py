@@ -375,3 +375,129 @@ class TestProviderCredentials:
             assert agent.client is mock_client
             assert agent.model == "test-model"
             assert agent.provider == provider
+
+
+# =============================================================================
+# Custom endpoint forwarding — regression tests for #3124
+# =============================================================================
+
+class TestCustomEndpointForwarding:
+    """Verify that fallback_model.base_url / api_key_env are forwarded to
+    resolve_provider_client() so a secondary custom endpoint is used instead
+    of the global OPENAI_BASE_URL value."""
+
+    def test_base_url_forwarded_to_resolve_provider_client(self):
+        """base_url in fallback config must be passed as explicit_base_url."""
+        agent = _make_agent(
+            fallback_model={
+                "provider": "custom",
+                "model": "local-llm",
+                "base_url": "http://localhost:1234/v1",
+            }
+        )
+        mock_client = _mock_resolve(base_url="http://localhost:1234/v1", api_key="lm-studio")
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "local-llm"),
+        ) as mock_resolve:
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        _, kwargs = mock_resolve.call_args
+        assert kwargs.get("explicit_base_url") == "http://localhost:1234/v1", (
+            "base_url from fallback config must be forwarded as explicit_base_url"
+        )
+
+    def test_api_key_env_resolved_and_forwarded(self):
+        """api_key_env in fallback config must be env-resolved and forwarded."""
+        agent = _make_agent(
+            fallback_model={
+                "provider": "custom",
+                "model": "local-llm",
+                "base_url": "http://localhost:1234/v1",
+                "api_key_env": "MY_LOCAL_KEY",
+            }
+        )
+        mock_client = _mock_resolve(base_url="http://localhost:1234/v1", api_key="sk-local")
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_client, "local-llm"),
+            ) as mock_resolve,
+            patch.dict("os.environ", {"MY_LOCAL_KEY": "sk-local-123"}),
+        ):
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        _, kwargs = mock_resolve.call_args
+        assert kwargs.get("explicit_api_key") == "sk-local-123", (
+            "api_key resolved from api_key_env must be forwarded as explicit_api_key"
+        )
+
+    def test_missing_api_key_env_forwards_none(self):
+        """When api_key_env is set but the env var is absent, explicit_api_key should be None."""
+        agent = _make_agent(
+            fallback_model={
+                "provider": "custom",
+                "model": "local-llm",
+                "base_url": "http://localhost:1234/v1",
+                "api_key_env": "NONEXISTENT_VAR_XYZ",
+            }
+        )
+        mock_client = _mock_resolve(base_url="http://localhost:1234/v1", api_key="")
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_client, "local-llm"),
+            ) as mock_resolve,
+            patch.dict("os.environ", {}, clear=False),
+        ):
+            # Remove the var if it exists
+            import os
+            os.environ.pop("NONEXISTENT_VAR_XYZ", None)
+            agent._try_activate_fallback()
+
+        _, kwargs = mock_resolve.call_args
+        assert kwargs.get("explicit_api_key") is None
+
+    def test_no_base_url_in_fallback_passes_none(self):
+        """When fallback config has no base_url, explicit_base_url must be None."""
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "google/gemini-3-flash"},
+        )
+        mock_client = _mock_resolve()
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "google/gemini-3-flash"),
+        ) as mock_resolve:
+            agent._try_activate_fallback()
+
+        _, kwargs = mock_resolve.call_args
+        assert kwargs.get("explicit_base_url") is None
+        assert kwargs.get("explicit_api_key") is None
+
+    def test_base_url_actually_used_for_client_base_url(self):
+        """After activation, agent.base_url must reflect the fallback endpoint."""
+        agent = _make_agent(
+            fallback_model={
+                "provider": "custom",
+                "model": "gguf-model",
+                "base_url": "http://192.168.1.10:8080/v1",
+            }
+        )
+        mock_client = _mock_resolve(base_url="http://192.168.1.10:8080/v1", api_key="none")
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "gguf-model"),
+        ):
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        # str(client.base_url) appends a trailing slash — check with strip
+        assert agent.base_url.rstrip("/") == "http://192.168.1.10:8080/v1"
+        assert agent.model == "gguf-model"
