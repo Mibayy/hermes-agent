@@ -14,13 +14,289 @@ Config files are stored in ~/.hermes/ for easy access.
 import importlib.util
 import logging
 import os
+import platform
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+
+# ---------------------------------------------------------------------------
+# GPU / hardware detection helpers (no external deps — stdlib only)
+# ---------------------------------------------------------------------------
+
+def _run_silent(cmd: List[str]) -> str:
+    """Run a command and return stdout, or '' on any error."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.stdout or ""
+    except Exception:
+        return ""
+
+
+def _parse_nvidia_gpus() -> List[Dict[str, Any]]:
+    """Detect NVIDIA GPUs via nvidia-smi.  Returns list of dicts with keys:
+    name, vram_mb, driver, cuda.
+    """
+    if not shutil.which("nvidia-smi"):
+        return []
+    out = _run_silent([
+        "nvidia-smi",
+        "--query-gpu=name,memory.total,driver_version",
+        "--format=csv,noheader,nounits",
+    ])
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            vram_mb = int(parts[1])
+        except ValueError:
+            vram_mb = 0
+        gpus.append({
+            "vendor": "nvidia",
+            "name": parts[0],
+            "vram_mb": vram_mb,
+            "driver": parts[2],
+        })
+    return gpus
+
+
+def _parse_amd_gpus() -> List[Dict[str, Any]]:
+    """Detect AMD ROCm GPUs via rocm-smi."""
+    if not shutil.which("rocm-smi"):
+        return []
+    out = _run_silent(["rocm-smi", "--showmeminfo", "vram", "--csv"])
+    gpus = []
+    for line in out.strip().splitlines():
+        if line.startswith("GPU") or not line.strip():
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        # rocm-smi csv: GPU,VRAM Total(MiB),VRAM Used(MiB)
+        try:
+            vram_mb = int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            vram_mb = 0
+        name = f"AMD GPU {parts[0]}"
+        gpus.append({
+            "vendor": "amd",
+            "name": name,
+            "vram_mb": vram_mb,
+            "driver": "ROCm",
+        })
+    return gpus
+
+
+def _parse_apple_silicon() -> List[Dict[str, Any]]:
+    """Detect Apple Silicon (M-series) via system_profiler."""
+    if platform.system() != "Darwin":
+        return []
+    out = _run_silent(["sysctl", "-n", "machdep.cpu.brand_string"])
+    chip = out.strip()
+    if not chip:
+        sp = _run_silent(["system_profiler", "SPHardwareDataType"])
+        m = re.search(r"Chip:\s+(.+)", sp)
+        chip = m.group(1).strip() if m else "Apple Silicon"
+    # Estimate unified memory (used as GPU memory)
+    mem_bytes_str = _run_silent(["sysctl", "-n", "hw.memsize"]).strip()
+    try:
+        total_ram_mb = int(mem_bytes_str) // (1024 * 1024)
+    except ValueError:
+        total_ram_mb = 0
+    if "Apple" in chip or total_ram_mb:
+        return [{
+            "vendor": "apple",
+            "name": chip or "Apple Silicon",
+            "vram_mb": total_ram_mb,  # unified memory
+            "driver": "Metal",
+        }]
+    return []
+
+
+def detect_local_gpu() -> List[Dict[str, Any]]:
+    """Detect available GPU hardware.  Returns a list of GPU dicts in priority order:
+    NVIDIA > AMD > Apple Silicon.  Each dict has: vendor, name, vram_mb, driver.
+    """
+    gpus = _parse_nvidia_gpus() or _parse_amd_gpus() or _parse_apple_silicon()
+    return gpus
+
+
+def generate_vllm_config(gpus: List[Dict[str, Any]], model: str = "") -> Dict[str, Any]:
+    """Given a list of GPU dicts, return recommended vLLM serve flags.
+
+    Returns a dict with keys: tensor_parallel_size, gpu_memory_utilization,
+    max_model_len (or None), dtype, and the full command string.
+    """
+    if not gpus:
+        return {}
+
+    num_gpus = len(gpus)
+    total_vram_mb = sum(g["vram_mb"] for g in gpus)
+    vendor = gpus[0]["vendor"]
+
+    # tensor-parallel = number of GPUs (vLLM handles multi-GPU automatically)
+    tensor_parallel = num_gpus
+
+    # Conservative memory utilization — leave headroom for KV cache
+    gpu_mem_util = 0.90 if vendor != "apple" else 0.85
+
+    # Estimate max_model_len based on total VRAM
+    # Rough heuristic: 1 GB VRAM ≈ 1k tokens context (varies heavily by model/quantization)
+    if total_vram_mb >= 40_000:
+        max_model_len = None  # let vLLM auto-detect; enough VRAM for full context
+    elif total_vram_mb >= 16_000:
+        max_model_len = 16384
+    elif total_vram_mb >= 8_000:
+        max_model_len = 8192
+    else:
+        max_model_len = 4096
+
+    # dtype recommendation
+    if vendor == "nvidia":
+        dtype = "bfloat16"
+    elif vendor == "amd":
+        dtype = "float16"  # ROCm bfloat16 support is uneven
+    else:
+        dtype = "float16"  # Metal
+
+    # Build the command
+    model_arg = model or "YOUR_MODEL_ID"
+    cmd_parts = [
+        "vllm serve", model_arg,
+        f"--tensor-parallel-size {tensor_parallel}",
+        f"--gpu-memory-utilization {gpu_mem_util}",
+        f"--dtype {dtype}",
+    ]
+    if max_model_len:
+        cmd_parts.append(f"--max-model-len {max_model_len}")
+
+    return {
+        "tensor_parallel_size": tensor_parallel,
+        "gpu_memory_utilization": gpu_mem_util,
+        "max_model_len": max_model_len,
+        "dtype": dtype,
+        "command": " \\\n  ".join(cmd_parts),
+        "base_url": "http://localhost:8000/v1",
+    }
+
+
+def run_local_gpu_setup(config: Optional[Dict[str, Any]] = None) -> None:
+    """Detect GPU hardware and print optimal vLLM configuration.
+
+    Called by ``hermes setup --local-gpu`` or ``hermes setup local-gpu``.
+    """
+    from hermes_cli.colors import color, Colors
+
+    # Local display helpers (print_* functions are defined later in this module)
+    def _ph(title: str) -> None:
+        print()
+        print(color(f"\u25c6 {title}", Colors.CYAN, Colors.BOLD))
+
+    def _pi(text: str) -> None:
+        print(color(f"  {text}", Colors.DIM))
+
+    def _ps(text: str) -> None:
+        print(color(f"\u2713 {text}", Colors.GREEN))
+
+    def _pw(text: str) -> None:
+        print(color(f"\u26a0 {text}", Colors.YELLOW))
+
+    def _pe(text: str) -> None:
+        print(color(f"\u2717 {text}", Colors.RED))
+
+    print()
+    print(color("\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510", Colors.CYAN))
+    print(color("\u2502         \u2695 Hermes \u2014 Local GPU Auto-Configuration         \u2502", Colors.CYAN))
+    print(color("\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518", Colors.CYAN))
+    print()
+    _pi("Scanning hardware...")
+    print()
+
+    gpus = detect_local_gpu()
+
+    if not gpus:
+        _pw("No GPU detected.")
+        print()
+        _pi("Checked: nvidia-smi (NVIDIA), rocm-smi (AMD), sysctl (Apple Silicon).")
+        _pi("If you have a GPU, make sure the drivers/ROCm tools are installed and in PATH.")
+        print()
+        _pi("For CPU-only inference, Ollama works out of the box:")
+        _pi("  OPENAI_BASE_URL=http://localhost:11434/v1 hermes")
+        return
+
+    # Print detected hardware
+    _ps(f"Detected {len(gpus)} GPU(s):")
+    for i, g in enumerate(gpus):
+        vram_str = f"{g['vram_mb'] / 1024:.1f} GB" if g["vram_mb"] else "unknown VRAM"
+        label = "unified memory" if g["vendor"] == "apple" else "VRAM"
+        _pi(f"  [{i}] {g['name']}  \u2014  {vram_str} {label}  ({g['driver']})")
+    print()
+
+    # Ask for model if interactive
+    model_id = ""
+    try:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                model_id = input(
+                    "  Model ID to serve (leave blank to show generic config): "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                model_id = ""
+    except Exception:
+        model_id = ""
+
+    cfg = generate_vllm_config(gpus, model_id)
+    if not cfg:
+        _pe("Could not generate config.")
+        return
+
+    print()
+    _ph("Recommended vLLM Command")
+    print()
+    print(f"  {cfg['command']}")
+    print()
+
+    total_vram_gb = sum(g["vram_mb"] for g in gpus) / 1024
+    _pi("Configuration rationale:")
+    _pi(f"  Total VRAM: {total_vram_gb:.1f} GB")
+    _pi(f"  --tensor-parallel-size {cfg['tensor_parallel_size']}  (one shard per GPU)")
+    _pi(f"  --gpu-memory-utilization {cfg['gpu_memory_utilization']}  (reserves headroom for KV cache)")
+    _pi(f"  --dtype {cfg['dtype']}")
+    if cfg["max_model_len"]:
+        _pi(f"  --max-model-len {cfg['max_model_len']}  (estimated from available VRAM; tune as needed)")
+    else:
+        _pi("  No --max-model-len (sufficient VRAM \u2014 let vLLM auto-detect)")
+    print()
+
+    _ph("Connect Hermes to vLLM")
+    print()
+    _pi("After starting vLLM, configure Hermes:")
+    _pi("  hermes setup  \u2192  Custom OpenAI-compatible endpoint")
+    _pi(f"  Base URL: {cfg['base_url']}")
+    print()
+    _pi("Or via env var:")
+    _pi(f"  OPENAI_BASE_URL={cfg['base_url']} hermes")
+    print()
+
+    # Offer Ollama tip if low VRAM
+    if total_vram_gb < 8:
+        _pw(
+            f"Low VRAM detected ({total_vram_gb:.1f} GB). "
+            "Consider Ollama with a quantized model (e.g. Q4_K_M) instead of vLLM:"
+        )
+        _pi("  ollama pull qwen2.5-coder:7b-instruct-q4_K_M")
+        _pi("  OPENAI_BASE_URL=http://localhost:11434/v1 hermes")
 
 
 def _model_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -80,6 +356,12 @@ _DEFAULT_PROVIDER_MODELS = {
     "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
     "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
     "kilocode": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
+    "gemini": [
+        "gemini-2.5-pro-preview-06-05",
+        "gemini-2.5-flash-preview-05-20",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+    ],
 }
 
 
@@ -884,6 +1166,7 @@ def setup_model_provider(config: dict):
         "OpenCode Go (open models, $10/month subscription)",
         "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)",
         "GitHub Copilot ACP (spawns `copilot --acp --stdio`)",
+        "Google Gemini (AI Studio — native SDK, reliable tool calls)",
     ]
     if keep_label:
         provider_choices.append(keep_label)
@@ -1528,7 +1811,39 @@ def setup_model_provider(config: dict):
         _set_model_provider(config, "copilot-acp", pconfig.inference_base_url)
         selected_base_url = pconfig.inference_base_url
 
-    # else: provider_idx == 16 (Keep current) — only shown when a provider already exists
+    elif provider_idx == 16:  # Google Gemini
+        selected_provider = "gemini"
+        print()
+        print_header("Google Gemini (AI Studio) API Key")
+        pconfig = PROVIDER_REGISTRY["gemini"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info("Uses the native google-generativeai SDK for reliable tool calls.")
+        print_info("Get your API key at: https://aistudio.google.com/apikey")
+        print()
+
+        existing_key = get_env_value("GOOGLE_API_KEY") or get_env_value("GEMINI_API_KEY")
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                api_key = prompt_password("Enter your Google AI Studio API key", password=True)
+                if api_key:
+                    save_env_value("GOOGLE_API_KEY", api_key)
+                    print_success("Google API key updated")
+        else:
+            api_key = prompt_password("Enter your Google AI Studio API key", password=True)
+            if api_key:
+                save_env_value("GOOGLE_API_KEY", api_key)
+                print_success("Google API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "gemini", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    # else: provider_idx == 17 (Keep current) — only shown when a provider already exists
     # Normalize "keep current" to an explicit provider so downstream logic
     # doesn't fall back to the generic OpenRouter/static-model path.
     if selected_provider is None:
@@ -3094,18 +3409,24 @@ def run_setup_wizard(args):
     """Run the interactive setup wizard.
 
     Supports full, quick, and section-specific setup:
-      hermes setup           — full or quick (auto-detected)
-      hermes setup model     — just model/provider
-      hermes setup terminal  — just terminal backend
-      hermes setup gateway   — just messaging platforms
-      hermes setup tools     — just tool configuration
-      hermes setup agent     — just agent settings
+      hermes setup              — full or quick (auto-detected)
+      hermes setup model        — just model/provider
+      hermes setup terminal     — just terminal backend
+      hermes setup gateway      — just messaging platforms
+      hermes setup tools        — just tool configuration
+      hermes setup agent        — just agent settings
+      hermes setup --local-gpu  — detect GPU and generate vLLM config
     """
     from hermes_cli.config import is_managed, managed_error
     if is_managed():
         managed_error("run setup wizard")
         return
     ensure_hermes_home()
+
+    # --local-gpu flag: hardware detection, no interactivity required
+    if getattr(args, "local_gpu", False):
+        run_local_gpu_setup()
+        return
 
     config = load_config()
     hermes_home = get_hermes_home()
