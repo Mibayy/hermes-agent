@@ -63,6 +63,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "opencode-zen": "gemini-3-flash",
     "opencode-go": "glm-5",
     "kilocode": "google/gemini-3-flash-preview",
+    "gemini": "gemini-2.5-flash-preview-05-20",
 }
 
 # OpenRouter app attribution headers
@@ -433,6 +434,27 @@ class AsyncAnthropicAuxiliaryClient:
         self.base_url = sync_wrapper.base_url
 
 
+# ── Gemini (Google AI Studio) adapter ────────────────────────────────────────
+# Thin re-export of the classes defined in gemini_adapter.py so that
+# resolve_provider_client() and _to_async_client() can reference them without
+# a circular import.  All actual logic lives in gemini_adapter.py.
+
+def _try_gemini() -> Tuple[Optional[Any], Optional[str]]:
+    """Return (GeminiAuxiliaryClient, model) if GOOGLE_API_KEY is set."""
+    try:
+        from agent.gemini_adapter import GeminiAuxiliaryClient, resolve_gemini_api_key
+    except ImportError:
+        return None, None
+
+    api_key = resolve_gemini_api_key()
+    if not api_key:
+        return None, None
+
+    model = _API_KEY_PROVIDER_AUX_MODELS.get("gemini", "gemini-2.5-flash-preview-05-20")
+    logger.debug("Auxiliary client: Gemini (%s)", model)
+    return GeminiAuxiliaryClient(api_key, model), model
+
+
 def _read_nous_auth() -> Optional[dict]:
     """Read and validate ~/.hermes/auth.json for an active Nous provider.
 
@@ -512,6 +534,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             continue
         if provider_id == "anthropic":
             return _try_anthropic()
+        if provider_id == "gemini":
+            return _try_gemini()
 
         creds = resolve_api_key_provider_credentials(provider_id)
         api_key = str(creds.get("api_key", "")).strip()
@@ -717,6 +741,12 @@ def _resolve_forced_provider(forced: str) -> Tuple[Optional[OpenAI], Optional[st
             logger.warning("auxiliary.provider=codex but no Codex OAuth token found (run: hermes model)")
         return client, model
 
+    if forced == "gemini":
+        client, model = _try_gemini()
+        if client is None:
+            logger.warning("auxiliary.provider=gemini but GOOGLE_API_KEY / GEMINI_API_KEY not set")
+        return client, model
+
     if forced == "main":
         # "main" = skip OpenRouter/Nous, use the main chat model's credentials.
         for try_fn in (_try_custom_endpoint, _try_codex, _resolve_api_key_provider):
@@ -763,6 +793,12 @@ def _to_async_client(sync_client, model: str):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
+    try:
+        from agent.gemini_adapter import GeminiAuxiliaryClient, AsyncGeminiAuxiliaryClient
+        if isinstance(sync_client, GeminiAuxiliaryClient):
+            return AsyncGeminiAuxiliaryClient(sync_client), model
+    except ImportError:
+        pass
 
     async_kwargs = {
         "api_key": sync_client.api_key,

@@ -212,6 +212,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("KILOCODE_API_KEY",),
         base_url_env_var="KILOCODE_BASE_URL",
     ),
+    "gemini": ProviderConfig(
+        id="gemini",
+        name="Google Gemini (AI Studio)",
+        auth_type="api_key",
+        inference_base_url="https://generativelanguage.googleapis.com/v1beta",
+        api_key_env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+        base_url_env_var="",
+    ),
 }
 
 
