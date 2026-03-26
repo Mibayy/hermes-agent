@@ -732,7 +732,9 @@ DELEGATE_TASK_SCHEMA = {
                     "Default: inherits your enabled toolsets. "
                     "Common patterns: ['terminal', 'file'] for code work, "
                     "['web'] for research, ['terminal', 'file', 'web'] for "
-                    "full-stack tasks."
+                    "full-stack tasks. Use 'web' to grant network access "
+                    "(web_search, web_extract). Use 'terminal' for shell "
+                    "access (also has network via curl, requests, etc.)."
                 ),
             },
             "tasks": {
@@ -745,7 +747,7 @@ DELEGATE_TASK_SCHEMA = {
                         "toolsets": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Toolsets for this specific task",
+                            "description": "Toolsets for this specific task. Use 'web' for network access, 'terminal' for shell.",
                         },
                     },
                     "required": ["goal"],
