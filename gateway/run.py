@@ -840,6 +840,32 @@ class GatewayRunner:
         return result
 
     @staticmethod
+    def _load_cache_ttl() -> str:
+        """Load prompt cache TTL from config with env fallback.
+
+        Checks agent.cache_ttl in config.yaml first, then
+        HERMES_CACHE_TTL as a fallback. Valid values: \"5m\", \"1h\".
+        Defaults to \"5m\" for any unknown value.
+        """
+        ttl = ""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                ttl = str(cfg.get("agent", {}).get("cache_ttl", "") or "").strip()
+        except Exception:
+            pass
+        if not ttl:
+            ttl = os.getenv("HERMES_CACHE_TTL", "")
+        if ttl not in ("5m", "1h"):
+            if ttl:
+                logger.warning("Unknown cache_ttl '%s', falling back to '5m'", ttl)
+            ttl = "5m"
+        return ttl
+
+    @staticmethod
     def _load_show_reasoning() -> bool:
         """Load show_reasoning toggle from config.yaml display section."""
         try:
@@ -3786,6 +3812,7 @@ class GatewayRunner:
                     platform=platform_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    cache_ttl=self._load_cache_ttl(),
                 )
 
                 return agent.run_conversation(
@@ -4818,6 +4845,7 @@ class GatewayRunner:
         runtime: dict,
         enabled_toolsets: list,
         ephemeral_prompt: str,
+        cache_ttl: str = "5m",
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -4838,6 +4866,7 @@ class GatewayRunner:
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
+                cache_ttl,
             ],
             sort_keys=True,
             default=str,
@@ -5210,11 +5239,13 @@ class GatewayRunner:
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
+            _cache_ttl = self._load_cache_ttl()
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
+                _cache_ttl,
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -5251,6 +5282,7 @@ class GatewayRunner:
                     honcho_config=honcho_config,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    cache_ttl=_cache_ttl,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
