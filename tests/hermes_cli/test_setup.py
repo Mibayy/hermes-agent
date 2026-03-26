@@ -90,6 +90,8 @@ def test_custom_setup_clears_active_oauth_provider(tmp_path, monkeypatch):
     def fake_prompt_choice(question, choices, default=0):
         if question == "Select your inference provider:":
             return 3
+        if question == "Configure vision:":
+            return len(choices) - 1  # skip vision
         tts_idx = _maybe_keep_current_tts(question, choices)
         if tts_idx is not None:
             return tts_idx
@@ -108,6 +110,7 @@ def test_custom_setup_clears_active_oauth_provider(tmp_path, monkeypatch):
     monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: False)
     monkeypatch.setattr("hermes_cli.auth.detect_external_credentials", lambda: [])
     monkeypatch.setattr("hermes_cli.main._save_custom_provider", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agent.auxiliary_client.get_available_vision_backends", lambda: [])
     monkeypatch.setattr(
         "hermes_cli.models.probe_api_models",
         lambda api_key, base_url: {"models": ["m"], "probed_url": base_url + "/models"},
@@ -138,6 +141,8 @@ def test_codex_setup_uses_runtime_access_token_for_live_model_list(tmp_path, mon
             return 2  # OpenAI Codex
         if question == "Select default model:":
             return 0
+        if question == "Configure vision:":
+            return len(choices) - 1  # skip vision
         tts_idx = _maybe_keep_current_tts(question, choices)
         if tts_idx is not None:
             return tts_idx
@@ -147,6 +152,7 @@ def test_codex_setup_uses_runtime_access_token_for_live_model_list(tmp_path, mon
     monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: "")
     monkeypatch.setattr("hermes_cli.auth.detect_external_credentials", lambda: [])
     monkeypatch.setattr("hermes_cli.auth._login_openai_codex", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agent.auxiliary_client.get_available_vision_backends", lambda: [])
     monkeypatch.setattr(
         "hermes_cli.auth.resolve_codex_runtime_credentials",
         lambda *args, **kwargs: {

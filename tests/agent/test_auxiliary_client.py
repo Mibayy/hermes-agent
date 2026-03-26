@@ -642,7 +642,8 @@ class TestVisionClientFallback:
     def test_vision_auto_includes_codex(self, codex_auth_dir):
         """Codex supports vision (gpt-5.3-codex), so auto mode should use it."""
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
-             patch("agent.auxiliary_client.OpenAI"):
+             patch("agent.auxiliary_client.OpenAI"), \
+             patch("agent.anthropic_adapter.build_anthropic_client", return_value=None):
             client, model = get_vision_auxiliary_client()
         from agent.auxiliary_client import CodexAuxiliaryClient
         assert isinstance(client, CodexAuxiliaryClient)
@@ -657,7 +658,8 @@ class TestVisionClientFallback:
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:1234/v1")
         monkeypatch.setenv("OPENAI_API_KEY", "local-key")
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
-             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+             patch("agent.auxiliary_client.OpenAI") as mock_openai, \
+             patch("agent.anthropic_adapter.build_anthropic_client", return_value=None):
             client, model = get_vision_auxiliary_client()
         assert client is not None  # Custom endpoint picked up as fallback
 
@@ -684,15 +686,17 @@ class TestVisionClientFallback:
 
     def test_vision_uses_openrouter_when_available(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai, \
+             patch("agent.anthropic_adapter.build_anthropic_client", return_value=None):
             client, model = get_vision_auxiliary_client()
         assert model == "google/gemini-3-flash-preview"
         assert client is not None
 
     def test_vision_uses_nous_when_available(self, monkeypatch):
         with patch("agent.auxiliary_client._read_nous_auth") as mock_nous, \
-             patch("agent.auxiliary_client.OpenAI"):
-            mock_nous.return_value = {"access_token": "nous-tok"}
+             patch("agent.auxiliary_client.OpenAI"), \
+             patch("agent.anthropic_adapter.build_anthropic_client", return_value=None):
+            mock_nous.return_value = {"access_token": "***"}
             client, model = get_vision_auxiliary_client()
         assert model == "gemini-3-flash"
         assert client is not None

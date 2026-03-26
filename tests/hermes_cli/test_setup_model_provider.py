@@ -63,6 +63,8 @@ def test_setup_keep_current_custom_from_config_does_not_fall_through(tmp_path, m
         if question == "Select your inference provider:":
             assert choices[-1] == "Keep current (Custom: https://example.invalid/v1)"
             return len(choices) - 1
+        if question == "Configure vision:":
+            return len(choices) - 1  # skip vision
         tts_idx = _maybe_keep_current_tts(question, choices)
         if tts_idx is not None:
             return tts_idx
@@ -73,6 +75,7 @@ def test_setup_keep_current_custom_from_config_does_not_fall_through(tmp_path, m
     monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: False)
     monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: None)
     monkeypatch.setattr("hermes_cli.auth.detect_external_credentials", lambda: [])
+    monkeypatch.setattr("agent.auxiliary_client.get_available_vision_backends", lambda: [])
 
     setup_model_provider(config)
     save_config(config)
@@ -404,6 +407,8 @@ def test_setup_switch_custom_to_codex_clears_custom_endpoint_and_updates_config(
             return 2  # OpenAI Codex
         if question == "Select default model:":
             return 0
+        if question == "Configure vision:":
+            return len(choices) - 1  # skip vision
         tts_idx = _maybe_keep_current_tts(question, choices)
         if tts_idx is not None:
             return tts_idx
@@ -415,11 +420,12 @@ def test_setup_switch_custom_to_codex_clears_custom_endpoint_and_updates_config(
     monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: None)
     monkeypatch.setattr("hermes_cli.auth.detect_external_credentials", lambda: [])
     monkeypatch.setattr("hermes_cli.auth._login_openai_codex", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agent.auxiliary_client.get_available_vision_backends", lambda: [])
     monkeypatch.setattr(
         "hermes_cli.auth.resolve_codex_runtime_credentials",
         lambda *args, **kwargs: {
             "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "codex-...oken",
+            "api_key": "***",
         },
     )
     monkeypatch.setattr(
@@ -449,6 +455,8 @@ def test_setup_summary_marks_codex_auth_as_vision_available(tmp_path, monkeypatc
     )
 
     monkeypatch.setattr("shutil.which", lambda _name: None)
+    # Codex supports vision — simulate the backend being available
+    monkeypatch.setattr("agent.auxiliary_client.get_available_vision_backends", lambda: ["openai-codex"])
 
     _print_setup_summary(load_config(), tmp_path)
     output = capsys.readouterr().out
