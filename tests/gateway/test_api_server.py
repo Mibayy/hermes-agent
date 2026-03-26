@@ -1437,3 +1437,125 @@ class TestConversationParameter:
                 assert resp.status == 200
                 # Conversation mapping should NOT be set since store=false
                 assert adapter._response_store.get_conversation("ephemeral-chat") is None
+
+
+# ---------------------------------------------------------------------------
+# Model routing
+# ---------------------------------------------------------------------------
+
+
+def _make_routing_adapter(routes: dict) -> APIServerAdapter:
+    """Create an adapter with model_routes configured."""
+    config = PlatformConfig(enabled=True, extra={"model_routes": routes})
+    return APIServerAdapter(config)
+
+
+class TestModelRouting:
+    def test_resolve_route_returns_none_for_unknown_alias(self):
+        adapter = _make_routing_adapter({"minimax-m2": {"model": "minimax/minimax-m1"}})
+        assert adapter._resolve_route("unknown-model") is None
+
+    def test_resolve_route_returns_config_for_known_alias(self):
+        routes = {"minimax-m2": {"model": "minimax/minimax-m1", "provider": "openrouter"}}
+        adapter = _make_routing_adapter(routes)
+        route = adapter._resolve_route("minimax-m2")
+        assert route is not None
+        assert route["model"] == "minimax/minimax-m1"
+        assert route["provider"] == "openrouter"
+
+    def test_no_routes_configured(self):
+        adapter = _make_routing_adapter({})
+        assert adapter._resolve_route("hermes-agent") is None
+        assert adapter._resolve_route("any-model") is None
+
+    def test_invalid_routes_config_falls_back_to_empty(self):
+        """Non-dict model_routes should be silently ignored."""
+        config = PlatformConfig(enabled=True, extra={"model_routes": "not-a-dict"})
+        adapter = APIServerAdapter(config)
+        assert adapter._model_routes == {}
+
+    @pytest.mark.asyncio
+    async def test_models_endpoint_lists_route_aliases(self):
+        routes = {
+            "minimax-m2": {"model": "minimax/minimax-m1", "provider": "openrouter"},
+            "gpt-5": {"model": "openai/gpt-5"},
+        }
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            assert resp.status == 200
+            data = await resp.json()
+            ids = {m["id"] for m in data["data"]}
+            assert "hermes-agent" in ids
+            assert "minimax-m2" in ids
+            assert "gpt-5" in ids
+
+    @pytest.mark.asyncio
+    async def test_models_endpoint_route_alias_root_field(self):
+        """Route alias entries should set ``root`` to the resolved model name."""
+        routes = {"my-alias": {"model": "openai/gpt-5"}}
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            data = await resp.json()
+            alias_entry = next(m for m in data["data"] if m["id"] == "my-alias")
+            assert alias_entry["root"] == "openai/gpt-5"
+            assert alias_entry["parent"] == "hermes-agent"
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_passes_route_to_run_agent(self):
+        """When model matches a route, _run_agent should receive the route dict."""
+        routes = {"minimax-m2": {"model": "minimax/minimax-m1", "provider": "openrouter"}}
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                await cli.post("/v1/chat/completions", json={
+                    "model": "minimax-m2",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                _, kwargs = mock_run.call_args
+                assert kwargs.get("route") == {"model": "minimax/minimax-m1", "provider": "openrouter"}
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_no_route_for_unknown_model(self):
+        """Unknown model alias should pass route=None to _run_agent."""
+        adapter = _make_routing_adapter({"minimax-m2": {"model": "minimax/minimax-m1"}})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                await cli.post("/v1/chat/completions", json={
+                    "model": "unknown-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                _, kwargs = mock_run.call_args
+                assert kwargs.get("route") is None
+
+    @pytest.mark.asyncio
+    async def test_responses_api_passes_route_to_run_agent(self):
+        """The /v1/responses endpoint should also honour model routing."""
+        routes = {"xiaozhi": {"model": "minimax/minimax-m1", "provider": "openrouter"}}
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                await cli.post("/v1/responses", json={
+                    "model": "xiaozhi",
+                    "input": "hello",
+                })
+                _, kwargs = mock_run.call_args
+                assert kwargs.get("route") == {"model": "minimax/minimax-m1", "provider": "openrouter"}

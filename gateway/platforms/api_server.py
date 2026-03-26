@@ -279,6 +279,21 @@ class APIServerAdapter(BasePlatformAdapter):
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
+        # model_routes: maps incoming ``model`` field values to specific
+        # provider/model configs.  Allows one API server instance to serve
+        # multiple clients on different backends.
+        #
+        # Config format (cli-config.yaml or gateway config extra block):
+        #   model_routes:
+        #     minimax-m2:          # alias the client sends as the "model" field
+        #       model: "minimax/minimax-m1"
+        #       provider: "openrouter"   # optional — uses default provider if omitted
+        #       api_key: "sk-…"          # optional — per-route key override
+        #       base_url: "https://…"    # optional — per-route base URL override
+        raw_routes = extra.get("model_routes") or {}
+        self._model_routes: Dict[str, Dict[str, str]] = (
+            raw_routes if isinstance(raw_routes, dict) else {}
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -356,23 +371,41 @@ class APIServerAdapter(BasePlatformAdapter):
     # Agent creation helper
     # ------------------------------------------------------------------
 
+    def _resolve_route(self, model_alias: str) -> Optional[Dict[str, str]]:
+        """Return the model_route config for *model_alias*, or None if not found."""
+        return self._model_routes.get(model_alias)
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        route: Optional[Dict[str, str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
 
         Uses _resolve_runtime_agent_kwargs() to pick up model, api_key,
         base_url, etc. from config.yaml / env vars.
+
+        If *route* is provided (a model_routes entry), its keys override the
+        global model/provider/api_key/base_url for this agent instance only.
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
+
+        if route:
+            if route.get("model"):
+                model = route["model"]
+            if route.get("provider"):
+                runtime_kwargs["provider"] = route["provider"]
+            if route.get("api_key"):
+                runtime_kwargs["api_key"] = route["api_key"]
+            if route.get("base_url"):
+                runtime_kwargs["base_url"] = route["base_url"]
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -398,25 +431,38 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — return hermes-agent as an available model."""
+        """GET /v1/models — return hermes-agent and any configured model route aliases."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
-        return web.json_response({
-            "object": "list",
-            "data": [
-                {
-                    "id": "hermes-agent",
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": "hermes-agent",
-                    "parent": None,
-                }
-            ],
-        })
+        now = int(time.time())
+        models = [
+            {
+                "id": "hermes-agent",
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": "hermes-agent",
+                "parent": None,
+            }
+        ]
+        # Expose configured model route aliases so clients can discover them.
+        for alias, route_cfg in self._model_routes.items():
+            if alias == "hermes-agent":
+                continue  # already listed above
+            models.append({
+                "id": alias,
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": route_cfg.get("model", alias),
+                "parent": "hermes-agent",
+            })
+
+        return web.json_response({"object": "list", "data": models})
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -473,6 +519,9 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
 
+        # Resolve model route — allows per-client model/provider selection.
+        route = self._resolve_route(model_name)
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
@@ -495,6 +544,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                route=route,
             ))
 
             return await self._write_sse_chat_completion(
@@ -508,6 +558,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -724,12 +775,16 @@ class APIServerAdapter(BasePlatformAdapter):
         # Run the agent (with Idempotency-Key support)
         session_id = str(uuid.uuid4())
 
+        # Resolve model route for per-client model/provider selection.
+        route = self._resolve_route(body.get("model", "hermes-agent"))
+
         async def _compute_response():
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1137,12 +1192,16 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        route: Optional[Dict[str, str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
 
         Returns ``(result_dict, usage_dict)`` where *usage_dict* contains
         ``input_tokens``, ``output_tokens`` and ``total_tokens``.
+
+        *route* is an optional model_routes entry that overrides the global
+        model/provider for this specific request.
         """
         loop = asyncio.get_event_loop()
 
@@ -1151,6 +1210,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                route=route,
             )
             result = agent.run_conversation(
                 user_message=user_message,
