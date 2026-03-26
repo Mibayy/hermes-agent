@@ -1487,10 +1487,26 @@ class GatewayRunner:
         if global_allowlist:
             allowed_ids.update(uid.strip() for uid in global_allowlist.split(",") if uid.strip())
 
-        # WhatsApp JIDs have @s.whatsapp.net suffix — strip it for comparison
+        # WhatsApp JIDs have @s.whatsapp.net suffix — strip it for comparison.
+        # WhatsApp also uses LID (Linked Identity Device) format e.g. 123456789@lid.
+        # Resolve LID to phone number using session mapping files so that users
+        # only need to configure their phone number in WHATSAPP_ALLOWED_USERS.
         check_ids = {user_id}
         if "@" in user_id:
             check_ids.add(user_id.split("@")[0])
+
+        if source.platform == Platform.WHATSAPP and user_id.endswith("@lid"):
+            lid_number = user_id.split("@")[0]
+            session_dir = os.path.expanduser("~/.hermes/whatsapp/session")
+            reverse_map_path = os.path.join(session_dir, f"lid-mapping-{lid_number}_reverse.json")
+            try:
+                with open(reverse_map_path) as f:
+                    phone = json.load(f)
+                if isinstance(phone, str) and phone:
+                    check_ids.add(phone)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+
         return bool(check_ids & allowed_ids)
 
     def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
