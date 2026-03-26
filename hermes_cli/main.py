@@ -819,6 +819,10 @@ def cmd_model(args):
         ("alibaba", "Alibaba Cloud / DashScope (Qwen models, Anthropic-compatible)"),
     ]
 
+    # Collect auth status for built-in providers so we can sort/label them
+    from hermes_cli.models import list_available_providers
+    _auth_status = {p["id"]: p["authenticated"] for p in list_available_providers()}
+
     # Add user-defined custom providers from config.yaml
     custom_providers_cfg = config.get("custom_providers") or []
     _custom_provider_map = {}  # key → {name, base_url, api_key}
@@ -842,6 +846,8 @@ def cmd_model(args):
                 "api_key": entry.get("api_key", ""),
                 "model": saved_model,
             }
+            # Named custom providers always count as authenticated (they have a URL)
+            _auth_status[key] = True
 
     # Always add the manual custom endpoint option last
     providers.append(("custom", "Custom endpoint (enter URL manually)"))
@@ -850,16 +856,28 @@ def cmd_model(args):
     if _custom_provider_map:
         providers.append(("remove-custom", "Remove a saved custom provider"))
 
-    # Reorder so the active provider is at the top
+    # Reorder: active first, then configured providers, then unconfigured (with marker).
+    # We never hide unconfigured providers because hermes model is also the setup flow.
     known_keys = {k for k, _ in providers}
     active_key = active if active in known_keys else "custom"
-    ordered = []
+
+    configured = []
+    unconfigured = []
     for key, label in providers:
+        if key in ("cancel", "remove-custom"):
+            continue
+        is_auth = _auth_status.get(key, False)
         if key == active_key:
-            ordered.insert(0, (key, f"{label}  ← currently active"))
+            configured.insert(0, (key, f"{label}  ← currently active"))
+        elif is_auth:
+            configured.append((key, label))
         else:
-            ordered.append((key, label))
+            unconfigured.append((key, f"{label}  [not configured]"))
+
+    ordered = configured + unconfigured
     ordered.append(("cancel", "Cancel"))
+    if _custom_provider_map:
+        ordered.append(("remove-custom", "Remove a saved custom provider"))
 
     provider_idx = _prompt_provider_choice([label for _, label in ordered])
     if provider_idx is None or ordered[provider_idx][0] == "cancel":
