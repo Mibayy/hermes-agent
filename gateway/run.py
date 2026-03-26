@@ -3802,7 +3802,16 @@ class GatewayRunner:
             return f"🧠 ✓ Reasoning effort set to `{effort}` (this session only)"
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
-        """Handle /compress command -- manually compress conversation context."""
+        """Handle /compress (/compact) command -- manually compress conversation context.
+
+        Supported flags (parsed from event.text after the command word):
+          --preview / --dry-run  report what would happen without modifying history
+          --aggressive           truncate to last 4 messages (no LLM call, instant)
+        """
+        raw_args = (event.text or "").lower().split()
+        preview = "--preview" in raw_args or "--dry-run" in raw_args
+        aggressive = "--aggressive" in raw_args
+
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
@@ -3810,24 +3819,53 @@ class GatewayRunner:
         if not history or len(history) < 4:
             return "Not enough conversation to compress (need at least 4 messages)."
 
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        msgs = [
+            {"role": m.get("role"), "content": m.get("content")}
+            for m in history
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        original_count = len(msgs)
+        approx_tokens = estimate_messages_tokens_rough(msgs)
+
+        # --- aggressive mode: instant truncation, no LLM call ---
+        if aggressive:
+            kept = msgs[-4:]
+            after_tokens = estimate_messages_tokens_rough(kept)
+            if preview:
+                return (
+                    f"🔍 Preview (--aggressive, --dry-run): would keep last 4 messages\n"
+                    f"{original_count} → {len(kept)} messages  "
+                    f"(~{approx_tokens:,} → ~{after_tokens:,} tokens)\n"
+                    f"No changes made."
+                )
+            self.session_store.rewrite_transcript(session_entry.session_id, kept)
+            self.session_store.update_session(
+                session_entry.session_key, last_prompt_tokens=after_tokens
+            )
+            return (
+                f"✅ Aggressive compact: {original_count} → {len(kept)} messages\n"
+                f"~{approx_tokens:,} → ~{after_tokens:,} tokens"
+            )
+
+        # --- preview / dry-run (standard compression) ---
+        if preview:
+            return (
+                f"🔍 Preview (--dry-run): {original_count} messages, "
+                f"~{approx_tokens:,} tokens.\n"
+                f"Send /compress to apply  ·  /compact --aggressive for instant truncation."
+            )
+
+        # --- standard LLM-based compression ---
         try:
             from run_agent import AIAgent
-            from agent.model_metadata import estimate_messages_tokens_rough
 
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             if not runtime_kwargs.get("api_key"):
                 return "No provider configured -- cannot compress."
 
-            # Resolve model from config (same reason as memory flush above).
             model = _resolve_gateway_model()
-
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ]
-            original_count = len(msgs)
-            approx_tokens = estimate_messages_tokens_rough(msgs)
 
             tmp_agent = AIAgent(
                 **runtime_kwargs,
@@ -3847,7 +3885,7 @@ class GatewayRunner:
             self.session_store.rewrite_transcript(session_entry.session_id, compressed)
             # Reset stored token count — transcript changed, old value is stale
             self.session_store.update_session(
-                session_entry.session_key, last_prompt_tokens=0,
+                session_entry.session_key, last_prompt_tokens=estimate_messages_tokens_rough(compressed)
             )
             new_count = len(compressed)
             new_tokens = estimate_messages_tokens_rough(compressed)

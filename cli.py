@@ -3682,7 +3682,7 @@ class HermesCLI:
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
         elif canonical == "compress":
-            self._manual_compress()
+            self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._show_usage()
         elif canonical == "insights":
@@ -4331,8 +4331,17 @@ class HermesCLI:
         self._reasoning_preview_buf = getattr(self, "_reasoning_preview_buf", "") + reasoning_text
         self._flush_reasoning_preview(force=False)
 
-    def _manual_compress(self):
-        """Manually trigger context compression on the current conversation."""
+    def _manual_compress(self, cmd: str = ""):
+        """Manually trigger context compression on the current conversation.
+
+        Supports flags:
+          --preview / --dry-run  show stats and a summary preview without modifying history
+          --aggressive           keep only the system prompt + last 2 exchanges (maximum reduction)
+        """
+        args = cmd.lower().split()
+        preview = "--preview" in args or "--dry-run" in args
+        aggressive = "--aggressive" in args
+
         if not self.conversation_history or len(self.conversation_history) < 4:
             print("(._.) Not enough conversation to compress (need at least 4 messages).")
             return
@@ -4348,7 +4357,39 @@ class HermesCLI:
         original_count = len(self.conversation_history)
         try:
             from agent.model_metadata import estimate_messages_tokens_rough
+
+            if aggressive:
+                # Aggressive mode: keep only the last 4 messages (2 exchanges).
+                # Skip the LLM summarisation step entirely — just truncate.
+                kept = self.conversation_history[-4:]
+                approx_before = estimate_messages_tokens_rough(self.conversation_history)
+                approx_after = estimate_messages_tokens_rough(kept)
+                if preview:
+                    print(
+                        f"  🔍 Preview (--aggressive, --dry-run): would keep last 4 messages\n"
+                        f"  {original_count} → {len(kept)} messages  "
+                        f"(~{approx_before:,} → ~{approx_after:,} tokens)\n"
+                        f"  No changes made."
+                    )
+                    return
+                self.conversation_history = kept
+                print(
+                    f"  ✅ Aggressive compact: {original_count} → {len(kept)} messages "
+                    f"(~{approx_before:,} → ~{approx_after:,} tokens)"
+                )
+                return
+
             approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
+
+            if preview:
+                print(
+                    f"  🔍 Preview (--dry-run): {original_count} messages, "
+                    f"~{approx_tokens:,} tokens.\n"
+                    f"  Run /compress (without --preview) to apply compression.\n"
+                    f"  Add --aggressive to truncate to the last 4 messages instead."
+                )
+                return
+
             print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
 
             compressed, new_system = self.agent._compress_context(
