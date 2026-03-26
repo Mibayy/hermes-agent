@@ -3647,6 +3647,73 @@ class HermesCLI:
                     _cprint("  Session database not available.")
         elif canonical == "new":
             self.new_session()
+        elif canonical == "resume":
+            parts = cmd_original.split(None, 1)
+            target_id = parts[1].strip() if len(parts) > 1 else ""
+            if not target_id:
+                _cprint("  Usage: /resume <session_id_or_title>")
+                _cprint("  Tip:   Use /history or `hermes sessions list` to find session IDs.")
+            elif not self._session_db:
+                _cprint("  Session database not available.")
+            else:
+                # Resolve title → session ID
+                from hermes_cli.main import _resolve_session_by_name_or_id
+                resolved = _resolve_session_by_name_or_id(target_id)
+                target_id = resolved or target_id
+
+                session_meta = self._session_db.get_session(target_id)
+                if not session_meta:
+                    _cprint(f"  Session not found: {target_id}")
+                    _cprint("  Use `hermes sessions list` to see available sessions.")
+                else:
+                    # End the current session cleanly
+                    if self._session_db and self.session_id:
+                        try:
+                            self._session_db.end_session(self.session_id, "resumed_other")
+                        except Exception:
+                            pass
+
+                    # Switch to the requested session
+                    old_id = self.session_id
+                    self.session_id = target_id
+                    self._resumed = True
+
+                    restored = self._session_db.get_messages_as_conversation(target_id)
+                    self.conversation_history = restored or []
+
+                    # Re-open the session (clear ended_at)
+                    try:
+                        self._session_db._conn.execute(
+                            "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                            (target_id,),
+                        )
+                        self._session_db._conn.commit()
+                    except Exception:
+                        pass
+
+                    # Sync the agent if already initialised
+                    if self.agent:
+                        self.agent.session_id = target_id
+                        if hasattr(self.agent, "_last_flushed_db_idx"):
+                            self.agent._last_flushed_db_idx = len(self.conversation_history)
+                        if hasattr(self.agent, "_invalidate_system_prompt"):
+                            self.agent._invalidate_system_prompt()
+
+                    title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
+                    msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
+                    if self.conversation_history:
+                        ChatConsole().print(
+                            f"[bold {_accent_hex()}]↻ Resumed session[/] "
+                            f"[bold]{_escape(target_id)}[/]"
+                            f"[bold {_accent_hex()}]{_escape(title_part)}[/] "
+                            f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
+                            f"{len(self.conversation_history)} total messages)"
+                        )
+                    else:
+                        ChatConsole().print(
+                            f"[bold {_accent_hex()}]↻ Resumed session {_escape(target_id)}"
+                            f"{_escape(title_part)} — no messages found, starting fresh.[/]"
+                        )
         elif canonical == "provider":
             self._show_model_and_providers()
         elif canonical == "prompt":

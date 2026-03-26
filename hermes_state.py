@@ -252,11 +252,18 @@ class SessionDB:
         user_id: str = None,
         parent_session_id: str = None,
     ) -> str:
-        """Create a new session record. Returns the session_id."""
+        """Create a new session record. Returns the session_id.
+
+        Uses INSERT OR IGNORE so calling this for an already-existing session
+        (e.g. when AIAgent.__init__ and the CLI both register the same session_id)
+        is a safe no-op rather than raising a UNIQUE constraint error.  Without
+        this the exception handler in AIAgent sets self._session_db = None and
+        silently drops all subsequent append_message calls for the session.
+        """
         with self._lock:
             self._conn.execute(
-                """INSERT INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
+                """INSERT OR IGNORE INTO sessions (id, source, user_id, model,
+                   model_config, system_prompt, parent_session_id, started_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,

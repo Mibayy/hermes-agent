@@ -893,8 +893,13 @@ class AIAgent:
                     user_id=None,
                 )
             except Exception as e:
-                logger.warning("Session DB create_session failed — messages will NOT be indexed: %s", e)
-                self._session_db = None  # prevent silent data loss on every subsequent flush
+                logger.warning("Session DB create_session failed — session may not be indexed: %s", e)
+                # Do NOT null out self._session_db here.  create_session now uses
+                # INSERT OR IGNORE so the only real failure cases are schema errors
+                # or I/O issues — in those cases append_message will also fail and
+                # log its own warning.  Nulling out _session_db caused all subsequent
+                # append_message calls to silently no-op, leaving the session row
+                # in the DB with zero messages (the --resume data-loss bug, #3123).
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -2032,6 +2037,25 @@ class AIAgent:
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
                 cleaned.append(msg)
+
+            # Safety guard: never overwrite a larger session log with a smaller one.
+            # This can happen when --resume is used on a session whose messages were
+            # never written to SQLite (bug #3123).  The resumed agent starts with an
+            # empty conversation_history, so the first _save_session_log call has only
+            # the current turn's messages — overwriting the full prior history on disk.
+            if self.session_log_file.exists():
+                try:
+                    import json as _json
+                    existing = _json.loads(self.session_log_file.read_text(encoding="utf-8"))
+                    existing_count = existing.get("message_count", len(existing.get("messages", [])))
+                    if existing_count > len(cleaned):
+                        logging.debug(
+                            "Skipping session log overwrite: existing has %d messages, current has %d",
+                            existing_count, len(cleaned),
+                        )
+                        return
+                except Exception:
+                    pass  # corrupted existing file — allow the overwrite
 
             entry = {
                 "session_id": self.session_id,
