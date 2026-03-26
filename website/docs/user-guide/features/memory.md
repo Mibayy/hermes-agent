@@ -207,6 +207,18 @@ memory:
   user_char_limit: 1375     # ~500 tokens
 ```
 
+## Structured Memory (Typed Fact Store)
+
+For more than ~15 facts, or when you need keyword search across hundreds of constraints, decisions, and open questions, the [`structured_memory` toolset](./structured-memory.md) adds a SQLite-backed typed store alongside MEMORY.md and USER.md:
+
+- MEMORY_SPEC notation: `C[db.id]: UUID mndtry`, `D[auth]: JWT 7d`
+- FTS5 search across all stored facts
+- Named scopes with auto-cooling
+- Automatic pressure management (merge, archive, push cold)
+- Zero config — just add `structured_memory` to your enabled toolsets
+
+See [Structured Memory](./structured-memory.md) for the full reference.
+
 ## Honcho Integration (Cross-Session User Modeling)
 
 For deeper, AI-generated user understanding that works across sessions and platforms, you can enable [Honcho Memory](./honcho.md). Honcho runs alongside built-in memory in `hybrid` mode (the default) — `MEMORY.md` and `USER.md` stay as-is, and Honcho adds a persistent user modeling layer on top.

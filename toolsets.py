@@ -171,7 +171,21 @@ TOOLSETS = {
         "tools": ["memory"],
         "includes": []
     },
-    
+
+    "structured_memory": {
+        "description": "Typed structured fact store with FTS5 search, scope lifecycle, and automatic gauge-based pressure management (C/D/V/?/✓/~ notation)",
+        "tools": [
+            "mcp_memory_write",
+            "mcp_memory_search",
+            "mcp_memory_reflect",
+            "mcp_memory_export",
+            "mcp_memory_purge",
+            "mcp_memory_optimize",
+            "mcp_memory_gauge",
+        ],
+        "includes": []
+    },
+
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],

@@ -843,6 +843,20 @@ memory:
   user_char_limit: 1375     # ~500 tokens
 ```
 
+## Structured Memory
+
+Enable the typed SQLite fact store alongside the flat-file memory tool:
+
+```yaml
+toolsets:
+  enabled:
+    - structured_memory   # Typed fact store: C/D/V/?/✓/~ notation, FTS5 search, scope lifecycle
+```
+
+No additional configuration required. Hot facts and the gauge percentage are injected into the system prompt automatically. `memory_tick` fires on every user message without consuming a tool-call turn.
+
+See [Structured Memory](/docs/user-guide/features/structured-memory) for the full reference.
+
 ## Git Worktree Isolation
 
 Enable isolated git worktrees for running multiple agents in parallel on the same repo:
