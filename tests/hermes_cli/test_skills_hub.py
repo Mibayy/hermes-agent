@@ -3,7 +3,7 @@ from io import StringIO
 import pytest
 from rich.console import Console
 
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import do_check, do_install, do_list, do_search, do_update, handle_skills_slash
 
 
 class _DummyLockFile:
@@ -231,3 +231,119 @@ def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_en
     do_install("skils-sh/anthropics/skills/frontend-design", console=console, skip_confirm=True)
 
     assert scanned["source"] == canonical_identifier
+
+
+
+# ---------------------------------------------------------------------------
+# Stale index entry error messages (#3259)
+# ---------------------------------------------------------------------------
+
+def _make_stale_source(source_id_val="skills-sh"):
+    """A source that returns index metadata but no bundle (stale entry)."""
+    class StaleSource:
+        def source_id(self):
+            return source_id_val
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "name": "vercel-react-best-practices",
+                "description": "Vercel React best practices",
+                "source": "skills.sh",
+                "identifier": identifier,
+                "trust_level": "community",
+                "repo": "vercel-labs/agent-skills",
+                "path": "vercel-react-best-practices",
+                "tags": [],
+                "extra": {},
+            })()
+        def fetch(self, identifier):
+            return None  # 404 - file gone from GitHub
+    return StaleSource()
+
+
+def test_do_install_stale_index_shows_helpful_message(monkeypatch, tmp_path, hub_env):
+    """When index has metadata but GitHub returns 404, show stale index entry message."""
+    import tools.skills_hub as hub
+
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_make_stale_source()])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_install("skills-sh/vercel-labs/agent-skills/vercel-react-best-practices", console=console)
+
+    output = sink.getvalue()
+    assert "stale" in output.lower() or "no longer exist" in output or "removed" in output
+
+
+def test_do_install_unknown_identifier_shows_generic_message(monkeypatch, tmp_path, hub_env):
+    """When neither meta nor bundle is found, show the generic Could not fetch message."""
+    import tools.skills_hub as hub
+
+    class EmptySource:
+        def source_id(self): return "github"
+        def inspect(self, identifier): return None
+        def fetch(self, identifier): return None
+
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [EmptySource()])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_install("github/nobody/nowhere/nonexistent-skill", console=console)
+
+    output = sink.getvalue()
+    assert "Could not fetch" in output
+    assert "stale" not in output.lower()
+
+
+def test_do_search_shows_skills_sh_caveat(monkeypatch):
+    """When search results include skills-sh entries, a caveat note is shown."""
+    import tools.skills_hub as hub
+
+    skills_sh_meta = type("Meta", (), {
+        "name": "vercel-react-best-practices",
+        "description": "Vercel React best practices",
+        "source": "skills-sh",
+        "identifier": "skills-sh/vercel-labs/agent-skills/vercel-react-best-practices",
+        "trust_level": "community",
+        "install_count": 251885,
+    })()
+
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+    monkeypatch.setattr(hub, "unified_search", lambda query, sources, source_filter, limit: [skills_sh_meta])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_search("react", console=console)
+
+    output = sink.getvalue()
+    assert "skills.sh" in output
+    assert "stale" in output.lower() or "removed" in output.lower() or "renamed" in output.lower()
+
+
+def test_do_search_no_caveat_for_official_only(monkeypatch):
+    """When all results are official, no skills.sh caveat is shown."""
+    import tools.skills_hub as hub
+
+    official_meta = type("Meta", (), {
+        "name": "python-dev",
+        "description": "Python development skill",
+        "source": "official",
+        "identifier": "official/development/python-dev",
+        "trust_level": "builtin",
+    })()
+
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+    monkeypatch.setattr(hub, "unified_search", lambda query, sources, source_filter, limit: [official_meta])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_search("python", console=console)
+
+    output = sink.getvalue()
+    assert "stale" not in output.lower()
+    assert "removed" not in output.lower()

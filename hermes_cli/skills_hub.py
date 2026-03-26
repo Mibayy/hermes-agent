@@ -176,7 +176,17 @@ def do_search(query: str, source: str = "all", limit: int = 10,
 
     c.print(table)
     c.print("[dim]Use: hermes skills inspect <identifier> to preview, "
-            "hermes skills install <identifier> to install[/]\n")
+            "hermes skills install <identifier> to install[/]")
+    skills_sh_count = sum(1 for r in results if r.source in ("skills.sh", "skills-sh"))
+    if skills_sh_count:
+        c.print(
+            f"[dim yellow]Note:[/] [dim]{skills_sh_count} result(s) come from the skills.sh index, "
+            "which may contain entries whose GitHub files have since been removed or renamed. "
+            "If installation fails with a 'stale index entry' error, the skill no longer exists "
+            "at its listed path.[/]\n"
+        )
+    else:
+        c.print()
 
 
 def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
@@ -330,7 +340,19 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not bundle:
-        c.print(f"[bold red]Error:[/] Could not fetch '{identifier}' from any source.\n")
+        if meta is not None:
+            # Index returned metadata but the underlying GitHub files are gone —
+            # this is a stale index entry, not a typo from the user.
+            src_label = getattr(_matched_source, "source_id", lambda: "the registry")()
+            c.print(
+                f"[bold red]Error:[/] '[bold]{identifier}[/]' appears in the "
+                f"[bold]{src_label}[/] index but the skill files no longer exist "
+                f"in the underlying repository (GitHub returned 404).\n"
+                f"[dim]This is a stale index entry. "
+                f"The skill may have been renamed or removed by its author.[/]\n"
+            )
+        else:
+            c.print(f"[bold red]Error:[/] Could not fetch '[bold]{identifier}[/]' from any source.\n")
         return
 
     # Auto-detect category for official skills (e.g. "official/autonomous-ai-agents/blackbox")
