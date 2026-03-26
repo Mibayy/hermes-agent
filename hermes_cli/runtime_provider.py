@@ -234,6 +234,12 @@ def _resolve_openrouter_runtime(
         if requested_norm == "auto":
             if (not cfg_provider or cfg_provider == "auto") and not env_openai_base_url:
                 use_config_base_url = True
+            elif cfg_provider == "custom":
+                # Config has provider:custom with a base_url — honour it even
+                # when requested_norm is "auto" so that OPENROUTER_API_KEY in
+                # .env doesn't silently override an explicitly saved custom
+                # endpoint on CLI restart (fixes #3263 config persistence loss).
+                use_config_base_url = True
         elif requested_norm == "custom" and cfg_provider == "custom":
             # provider: custom — use base_url from config (Fixes #1760).
             use_config_base_url = True

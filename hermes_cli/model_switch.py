@@ -141,7 +141,33 @@ def switch_model(
             api_key=api_key,
             base_url=base_url,
         )
-    except Exception:
+    except Exception as _val_exc:
+        _exc_str = str(_val_exc)
+        # For custom/local endpoints, surface connection errors explicitly so
+        # the user knows their endpoint is unreachable (fixes silent failures
+        # where "Connection refused" was swallowed and reported as success).
+        _is_custom_endpoint = target_provider == "custom" or (
+            base_url
+            and "openrouter.ai" not in base_url
+            and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url)
+        )
+        _is_connection_error = any(
+            kw in _exc_str.lower()
+            for kw in ("connection refused", "connectionrefused", "connect error",
+                       "connecterror", "connection error", "econnrefused",
+                       "timed out", "timeout", "name or service not known",
+                       "no route to host", "network is unreachable", "401", "403", "404")
+        )
+        if _is_custom_endpoint and _is_connection_error:
+            return ModelSwitchResult(
+                success=False,
+                new_model=new_model,
+                target_provider=target_provider,
+                base_url=base_url,
+                error_message=f"Could not reach custom endpoint: {_exc_str}",
+            )
+        # For cloud providers or unrecognised errors, fall back to accepting
+        # the model so a temporary API outage doesn't block the switch.
         validation = {
             "accepted": True,
             "persist": True,

@@ -1116,24 +1116,53 @@ def _model_flow_custom(config):
     from hermes_cli.auth import _save_model_choice, deactivate_provider
     from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
 
-    current_url = get_env_value("OPENAI_BASE_URL") or ""
+    # Read saved values from config.yaml first, then fall back to env vars.
+    # This ensures a previously configured custom endpoint is offered as the
+    # default rather than requiring the user to re-type it every time.
+    _cfg = load_config()
+    _model_cfg = _cfg.get("model") or {}
+    current_url = (
+        _model_cfg.get("base_url", "").strip()
+        or get_env_value("OPENAI_BASE_URL")
+        or ""
+    )
     current_key = get_env_value("OPENAI_API_KEY") or ""
+    current_model = (
+        _model_cfg.get("default", "").strip()
+        or get_env_value("HERMES_MODEL")
+        or ""
+    )
 
     print("Custom OpenAI-compatible endpoint configuration:")
     if current_url:
         print(f"  Current URL: {current_url}")
     if current_key:
         print(f"  Current key: {current_key[:8]}...")
+    if current_model:
+        print(f"  Current model: {current_model}")
+    print()
+    print("  Press Enter to keep the current value shown in [brackets].")
     print()
 
     try:
-        base_url = input(f"API base URL [{current_url or 'e.g. https://api.example.com/v1'}]: ").strip()
-        api_key = input(f"API key [{current_key[:8] + '...' if current_key else 'optional'}]: ").strip()
-        model_name = input("Model name (e.g. gpt-4, llama-3-70b): ").strip()
+        _url_hint = current_url or "e.g. https://api.example.com/v1"
+        base_url = input(f"API base URL [{_url_hint}]: ").strip()
+        _key_hint = (current_key[:8] + "...") if current_key else "optional, press Enter to skip"
+        api_key = input(f"API key [{_key_hint}]: ").strip()
+        _model_hint = current_model or "e.g. gpt-4, llama-3-70b"
+        model_name = input(f"Model name [{_model_hint}]: ").strip()
         context_length_str = input("Context length in tokens [leave blank for auto-detect]: ").strip()
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled.")
         return
+
+    # Apply defaults: empty input → keep current value
+    if not base_url and current_url:
+        base_url = current_url
+    if not api_key and current_key:
+        api_key = current_key
+    if not model_name and current_model:
+        model_name = current_model
 
     context_length = None
     if context_length_str:
