@@ -374,6 +374,7 @@ class TestVisionRequirements:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("AUXILIARY_VISION_PROVIDER", raising=False)
         monkeypatch.delenv("CONTEXT_VISION_PROVIDER", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.build_anthropic_client", lambda *a, **kw: None)
 
         assert check_vision_requirements() is True
 

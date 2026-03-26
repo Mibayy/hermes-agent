@@ -92,7 +92,15 @@ class TestGeneratedSystemdUnits:
 
         assert "/home/test/.nvm/versions/node/v24.14.0/bin" in unit
 
-    def test_system_unit_avoids_recursive_execstop_and_uses_extended_stop_timeout(self):
+    def test_system_unit_avoids_recursive_execstop_and_uses_extended_stop_timeout(self, monkeypatch):
+        # generate_systemd_unit(system=True) calls _system_service_identity() which
+        # refuses to run as root (checks SUDO_USER/USER/LOGNAME/getpass.getuser).
+        # Mock all of these so the test passes in CI/root environments.
+        monkeypatch.setattr("os.getuid", lambda: 1000)
+        monkeypatch.setenv("SUDO_USER", "hermes")
+        monkeypatch.setenv("USER", "hermes")
+        monkeypatch.setenv("LOGNAME", "hermes")
+        monkeypatch.setattr("getpass.getuser", lambda: "hermes")
         unit = gateway_cli.generate_systemd_unit(system=True)
 
         assert "ExecStart=" in unit

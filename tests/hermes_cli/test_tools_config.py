@@ -45,6 +45,7 @@ def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("AUXILIARY_VISION_PROVIDER", raising=False)
     monkeypatch.delenv("CONTEXT_VISION_PROVIDER", raising=False)
+    monkeypatch.setattr("agent.anthropic_adapter.build_anthropic_client", lambda *a, **kw: None)
 
     assert _toolset_has_keys("vision") is True
 
