@@ -20,6 +20,7 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -771,10 +772,11 @@ def delegate_task(
 
     # Depth limit
     depth = getattr(parent_agent, '_delegate_depth', 0)
-    if depth >= _get_max_depth():
+    max_depth = _get_max_depth()
+    if depth >= max_depth:
         return json.dumps({
             "error": (
-                f"Delegation depth limit reached ({_get_max_depth()}). "
+                f"Delegation depth limit reached ({max_depth}). "
                 "Subagents cannot spawn further subagents."
             )
         })
@@ -832,6 +834,8 @@ def delegate_task(
 
     overall_start = time.monotonic()
     results = []
+    _results_lock = threading.Lock()
+    _completed_by_id: Dict[str, Dict[str, Any]] = {}  # thread-safe completed results for DAG
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -886,12 +890,15 @@ def delegate_task(
 
     def _run_task(i: int, t: dict) -> Dict[str, Any]:
         """Run a single task with retry + verify."""
-        # DAG: inject predecessor summaries if dag enabled
+        # DAG: inject predecessor summaries if dag enabled.
+        # Use _completed_by_id (protected by _results_lock) instead of reading
+        # the shared `results` list directly -- avoids a race condition in the
+        # ThreadPoolExecutor batch path where concurrent tasks could see
+        # partially-written list state.
         resolved_task = t
         if dag_enabled:
-            completed_so_far = {
-                str(r.get('task_index', '')): r for r in results
-            }
+            with _results_lock:
+                completed_so_far = dict(_completed_by_id)
             resolved_task = resolve_deps(t, completed_so_far)
 
         task_kwargs = dict(_base_builder_kwargs)
@@ -926,6 +933,8 @@ def delegate_task(
         else:
             result = _run_single_child(0, _t["goal"], child, parent_agent)
             result = _run_with_verify(result, _t, parent_agent, cfg)
+        with _results_lock:
+            _completed_by_id[str(result.get('task_index', 0))] = result
         results.append(result)
         if callable(on_task_done):
             try:
@@ -967,6 +976,8 @@ def delegate_task(
                         "api_calls": 0,
                         "duration_seconds": 0,
                     }
+                with _results_lock:
+                    _completed_by_id[str(entry.get('task_index', _fi))] = entry
                 results.append(entry)
                 if callable(on_task_done):
                     try:
