@@ -4926,6 +4926,34 @@ class AIAgent:
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
+        # Archive messages to the compressed buffer BEFORE they're dropped.
+        # This enables session_search_current to find content from earlier in
+        # the same session even after context compression (issue #2667).
+        if self._session_db:
+            try:
+                # Resolve root session ID (walk up parent chain)
+                root_sid = self.session_id
+                _visited: set = set()
+                _sid = self.session_id
+                while _sid and _sid not in _visited:
+                    _visited.add(_sid)
+                    _s = self._session_db.get_session(_sid)
+                    _parent = _s.get("parent_session_id") if _s else None
+                    if _parent:
+                        _sid = _parent
+                    else:
+                        root_sid = _sid
+                        break
+                archived = self._session_db.archive_compressed_messages(
+                    root_session_id=root_sid,
+                    messages=messages,
+                    compression_round=self.context_compressor.compression_count + 1,
+                )
+                if archived:
+                    logger.debug("Archived %d messages to compressed buffer (root=%s)", archived, root_sid)
+            except Exception as _e:
+                logger.debug("Failed to archive messages to compressed buffer: %s", _e)
+
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
         todo_snapshot = self._todo_store.format_for_injection()
@@ -5021,6 +5049,17 @@ class AIAgent:
                 query=function_args.get("query", ""),
                 role_filter=function_args.get("role_filter"),
                 limit=function_args.get("limit", 3),
+                db=self._session_db,
+                current_session_id=self.session_id,
+            )
+        elif function_name == "session_buffer_search":
+            if not self._session_db:
+                return json.dumps({"success": False, "error": "Session database not available."})
+            from tools.session_buffer_search_tool import session_buffer_search as _session_buffer_search
+            return _session_buffer_search(
+                query=function_args.get("query", ""),
+                role_filter=function_args.get("role_filter"),
+                limit=function_args.get("limit", 10),
                 db=self._session_db,
                 current_session_id=self.session_id,
             )
@@ -5355,6 +5394,21 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+            elif function_name == "session_buffer_search":
+                if not self._session_db:
+                    function_result = json.dumps({"success": False, "error": "Session database not available."})
+                else:
+                    from tools.session_buffer_search_tool import session_buffer_search as _session_buffer_search
+                    function_result = _session_buffer_search(
+                        query=function_args.get("query", ""),
+                        role_filter=function_args.get("role_filter"),
+                        limit=function_args.get("limit", 10),
+                        db=self._session_db,
+                        current_session_id=self.session_id,
+                    )
+                tool_duration = time.time() - tool_start_time
+                if self.quiet_mode:
+                    self._vprint(f"  {_get_cute_tool_message_impl('session_buffer_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
