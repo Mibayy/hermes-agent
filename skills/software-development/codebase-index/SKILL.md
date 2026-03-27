@@ -81,6 +81,20 @@ search_codebase(pattern="contextTokens", file_glob="*.py")
 → returns: file, line number, matching line — no noise
 ```
 
+## Pairs well with hermes-memory
+
+codebase-index and hermes-memory (PR #2692) solve complementary problems:
+
+- **codebase-index** keeps code navigation cheap — symbols instead of files,
+  so the context stays small during exploration.
+- **hermes-memory** keeps decisions durable — architectural constraints, design
+  choices, and open questions survive context compression and are searchable
+  across turns via FTS5.
+
+Running both is the recommended setup for extended development sessions. Neither
+replaces the other: one controls what the agent reads, the other controls what
+the agent remembers.
+
 ## Pitfalls
 
 - **Cold start**: first index takes a few seconds per project. Normal.
