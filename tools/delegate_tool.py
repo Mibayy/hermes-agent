@@ -75,6 +75,7 @@ def _load_skill_content(name: str) -> str | None:
                 return skill_md.read_text(encoding='utf-8')
             except OSError:
                 pass
+    logger.debug("Skill '%s' not found in search paths: %s", name, [str(b) for b in search_bases])
     return None
 
 
@@ -118,10 +119,11 @@ def _format_structured_context(context: Union[str, Dict[str, Any]]) -> str:
     for key, val in context.items():
         if key in known:
             continue
+        header = key.replace('_', ' ').title()
         if isinstance(val, list):
-            sections.append(f'{key.capitalize()}:\n' + '\n'.join(f'  - {v}' for v in val))
+            sections.append(f'{header}:\n' + '\n'.join(f'  - {v}' for v in val))
         else:
-            sections.append(f'{key.capitalize()}:\n{val}')
+            sections.append(f'{header}:\n{val}')
 
     return '\n\n'.join(sections)
 
@@ -613,6 +615,8 @@ def _build_detailed_trace(
 # Generator-critic loop
 # ---------------------------------------------------------------------------
 
+_CRITIC_MAX_SUMMARY_CHARS = 4000
+
 _CRITIC_PROMPT_TEMPLATE = (
     "You are a critical reviewer. A subagent was given this goal:\n\n"
     "GOAL: {goal}\n\n"
@@ -648,7 +652,7 @@ def _run_with_verify(
 
     critic_goal = _CRITIC_PROMPT_TEMPLATE.format(
         goal=task.get('goal', ''),
-        summary=summary[:4000],
+        summary=summary[:_CRITIC_MAX_SUMMARY_CHARS],
     )
 
     critic_model = verify_cfg.get('model') or None
@@ -659,7 +663,7 @@ def _run_with_verify(
             task_index=task_index,
             goal=critic_goal,
             context=None,
-            toolsets=['terminal'],
+            toolsets=[],  # critic only reads a summary string -- no tools needed
             model=critic_model,
             max_iterations=10,
             parent_agent=parent_agent,
@@ -885,7 +889,7 @@ def delegate_task(
         override_api_mode=creds["api_mode"],
         memory_mode=memory_mode,
         skills=None,
-        blackboard=bb,
+        blackboard=bb,  # same Blackboard instance shared by all siblings; None when disabled
     )
 
     def _run_task(i: int, t: dict) -> Dict[str, Any]:
