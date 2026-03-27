@@ -31,6 +31,8 @@ try:
 except ImportError:
     _SM_AVAILABLE = False
 
+from tools.delegate_blackboard import Blackboard
+
 
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset([
@@ -74,7 +76,7 @@ def _load_skill_content(name: str) -> str | None:
     return None
 
 
-def _build_child_system_prompt(goal: str, context: Optional[str] = None, skills: list | None = None) -> str:
+def _build_child_system_prompt(goal: str, context: Optional[str] = None, skills: list | None = None, blackboard: 'Blackboard | None' = None) -> str:
     """Build a focused system prompt for a child agent."""
     parts = [
         "You are a focused subagent working on a specific delegated task.",
@@ -101,6 +103,8 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None, skills:
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    if blackboard and blackboard.snapshot():
+        parts.append(blackboard.to_context_string())
     return "\n".join(parts)
 
 
@@ -211,6 +215,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     memory_mode: str = 'none',
     skills: list | None = None,
+    blackboard: 'Blackboard | None' = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -234,7 +239,7 @@ def _build_child_agent(
     else:
         child_toolsets = _compute_child_toolsets(DEFAULT_TOOLSETS, memory_mode)
 
-    child_prompt = _build_child_system_prompt(goal, context, skills=skills)
+    child_prompt = _build_child_system_prompt(goal, context, skills=skills, blackboard=blackboard)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -455,6 +460,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     parent_agent=None,
+    on_task_done=None,   # callable(task_index, result_dict) | None -- fired immediately when each task completes
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -483,6 +489,9 @@ def delegate_task(
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
     memory_mode = cfg.get('delegation', {}).get('memory_access', 'none')
+
+    # Blackboard: shared key-value store for sibling subagents in this batch
+    bb = Blackboard() if cfg.get('blackboard', {}).get('enabled', False) else None
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -538,6 +547,7 @@ def delegate_task(
                 override_api_mode=creds["api_mode"],
                 memory_mode=memory_mode,
                 skills=t.get("skills"),
+                blackboard=bb,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -551,6 +561,11 @@ def delegate_task(
         _i, _t, child = children[0]
         result = _run_single_child(0, _t["goal"], child, parent_agent)
         results.append(result)
+        if callable(on_task_done):
+            try:
+                on_task_done(result['task_index'], result)
+            except Exception as e:
+                logger.debug('on_task_done callback raised: %s', e)
     else:
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
@@ -582,6 +597,11 @@ def delegate_task(
                         "duration_seconds": 0,
                     }
                 results.append(entry)
+                if callable(on_task_done):
+                    try:
+                        on_task_done(entry['task_index'], entry)
+                    except Exception as e:
+                        logger.debug('on_task_done callback raised: %s', e)
                 completed_count += 1
 
                 # Print per-task completion line above the spinner
