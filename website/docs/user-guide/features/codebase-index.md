@@ -80,7 +80,7 @@ re-indexed between sessions.
 Once configured, Hermes has access to:
 
 | Tool | What it does |
-|------|--------------| 
+|------|--------------|
 | `search_codebase` | Regex search across all indexed files |
 | `find_symbol` | Locate a function/class by name — returns file, line, preview |
 | `get_function_source` | Full source of a function without reading the whole file |
@@ -120,22 +120,17 @@ hermes> load the codebase-index skill
 
 See [Skills](../skills/) for how bundled skills work.
 
-## Pairs well with hermes-memory
+## Pairs well with structured memory
 
-codebase-index and [hermes-memory](https://github.com/NousResearch/hermes-agent/pull/2692)
-solve complementary problems in long coding sessions.
-
-hermes-memory is a Hermes plugin (installed via `pip install hermes-memory`,
-configured as a plugin in `~/.hermes/plugins/`) that provides structured
-persistent memory across sessions — typed facts (constraints, decisions, values),
-FTS5 search, automatic pressure management, and slash commands like
-`/memory status` and `/memory search`.
+codebase-index works well alongside the native structured memory toolset
+(PR #3093), which provides a typed, searchable fact store built directly into
+Hermes — no external process, no configuration beyond enabling the toolset.
 
 - **codebase-index** keeps code navigation cheap — the agent reads symbols,
   not files, so the context stays small during exploration.
-- **hermes-memory** keeps decisions durable — architectural choices, constraints,
-  and open questions survive context compression and stay queryable across turns.
+- **structured memory** keeps decisions durable — architectural constraints,
+  design choices, and open questions are stored as typed facts (`C[]`, `D[]`,
+  `V[]`) that survive context compression and are searchable across turns.
 
 Together they address the two main ways long sessions degrade: context bloat
 from reading too much code, and decision drift from forgetting what was agreed.
-Running both is the recommended setup for extended development work.
