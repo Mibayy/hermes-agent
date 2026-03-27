@@ -21,6 +21,7 @@ import logging
 logger = logging.getLogger(__name__)
 import os
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
@@ -57,7 +58,23 @@ def check_delegate_requirements() -> bool:
     return True
 
 
-def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
+def _load_skill_content(name: str) -> str | None:
+    search_bases = [
+        Path(__file__).parent.parent / 'skills',
+        Path.home() / '.hermes' / 'skills',
+    ]
+    for base in search_bases:
+        if not base.exists():
+            continue
+        for skill_md in base.rglob(f'{name}/SKILL.md'):
+            try:
+                return skill_md.read_text(encoding='utf-8')
+            except OSError:
+                pass
+    return None
+
+
+def _build_child_system_prompt(goal: str, context: Optional[str] = None, skills: list | None = None) -> str:
     """Build a focused system prompt for a child agent."""
     parts = [
         "You are a focused subagent working on a specific delegated task.",
@@ -66,6 +83,14 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+    if skills:
+        skill_sections = []
+        for skill_name in skills:
+            content = _load_skill_content(skill_name)
+            if content:
+                skill_sections.append(f'\n--- Skill: {skill_name} ---\n{content}')
+        if skill_sections:
+            parts.append('\nLoaded skills:' + ''.join(skill_sections))
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -185,6 +210,7 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     memory_mode: str = 'none',
+    skills: list | None = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -208,7 +234,7 @@ def _build_child_agent(
     else:
         child_toolsets = _compute_child_toolsets(DEFAULT_TOOLSETS, memory_mode)
 
-    child_prompt = _build_child_system_prompt(goal, context)
+    child_prompt = _build_child_system_prompt(goal, context, skills=skills)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -511,6 +537,7 @@ def delegate_task(
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
                 memory_mode=memory_mode,
+                skills=t.get("skills"),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
