@@ -346,6 +346,33 @@ DEFAULT_CONFIG = {
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
+        "max_depth": 1,
+        "memory_access": "none",
+        "checkpoint": {
+            "enabled": False,
+            "interval_iterations": 10,
+            "db_path": "",
+        },
+        "retry": {
+            "max_retries": 0,
+            "inject_failure_context": True,
+        },
+        "verify": {
+            "enabled": False,
+            "model": "",
+        },
+        "dag": {
+            "enabled": False,
+        },
+        "blackboard": {
+            "enabled": False,
+        },
+        "semantic_cache": {
+            "enabled": False,
+        },
+        "observability": {
+            "detailed_trace": False,
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
