@@ -32,6 +32,7 @@ except ImportError:
     _SM_AVAILABLE = False
 
 from tools.delegate_blackboard import Blackboard
+from tools.delegate_dag import topological_sort, resolve_deps
 
 
 # Tools that children must never have access to
@@ -453,6 +454,219 @@ def _run_single_child(
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 
+# ---------------------------------------------------------------------------
+# Semantic dedup cache (graceful no-op without structured memory)
+# ---------------------------------------------------------------------------
+
+def _sm_search_goal(goal: str, limit: int = 3) -> list:
+    """Search structured memory for facts matching this goal. Returns [] if unavailable."""
+    if not _SM_AVAILABLE:
+        return []
+    try:
+        from tools.structured_memory.facts import search
+        return search(goal[:60], limit=limit)
+    except Exception:
+        return []
+
+
+def _check_semantic_cache(goal: str) -> Optional[str]:
+    """
+    Look for a recent cached result for a similar goal in structured memory.
+    Returns the cached summary string, or None if no hit.
+    """
+    hits = _sm_search_goal(goal, limit=3)
+    if not hits:
+        return None
+    return hits[0].get('value')
+
+
+# ---------------------------------------------------------------------------
+# Detailed observability trace
+# ---------------------------------------------------------------------------
+
+def _build_detailed_trace(
+    messages: Optional[list],
+    tool_timing: Optional[Dict[str, Any]] = None,
+) -> list:
+    """
+    Build an enriched trace from conversation messages.
+    tool_timing: optional dict mapping tool_call_id -> (start, end) monotonic times.
+    Returns list of trace entries with tool name, bytes, status, and optional duration_ms.
+    """
+    trace: list = []
+    trace_by_id: Dict[str, Dict[str, Any]] = {}
+
+    for msg in (messages or []):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get('role') == 'assistant':
+            for tc in (msg.get('tool_calls') or []):
+                fn = tc.get('function', {})
+                tc_id = tc.get('id', '')
+                entry: Dict[str, Any] = {
+                    'tool': fn.get('name', 'unknown'),
+                    'args_bytes': len(fn.get('arguments', '')),
+                }
+                if tool_timing and tc_id in tool_timing:
+                    start, end = tool_timing[tc_id]
+                    entry['duration_ms'] = round((end - start) * 1000)
+                trace.append(entry)
+                if tc_id:
+                    trace_by_id[tc_id] = entry
+        elif msg.get('role') == 'tool':
+            content = msg.get('content', '') or ''
+            is_error = 'error' in content[:80].lower()
+            result_meta = {
+                'result_bytes': len(content),
+                'status': 'error' if is_error else 'ok',
+            }
+            tc_id = msg.get('tool_call_id')
+            target = trace_by_id.get(tc_id) if tc_id else (trace[-1] if trace else None)
+            if target is not None:
+                target.update(result_meta)
+    return trace
+
+
+# ---------------------------------------------------------------------------
+# Generator-critic loop
+# ---------------------------------------------------------------------------
+
+_CRITIC_PROMPT_TEMPLATE = (
+    "You are a critical reviewer. A subagent was given this goal:\n\n"
+    "GOAL: {goal}\n\n"
+    "It produced this result:\n{summary}\n\n"
+    "Review the result. Respond with exactly one of:\n"
+    "VERDICT: valid   -- result is correct and complete\n"
+    "VERDICT: invalid -- result has errors, missing cases, or logic flaws\n\n"
+    "Then explain your reasoning in 2-5 sentences. Be concise and specific."
+)
+
+
+def _run_with_verify(
+    generator_result: Dict[str, Any],
+    task: Dict[str, Any],
+    parent_agent,
+    cfg: dict,
+) -> Dict[str, Any]:
+    """
+    Optionally run a critic subagent after the generator.
+    Activated when task has verify=True or delegation.verify.enabled=True.
+    Attaches 'verdict' and 'critic_summary' to the result dict.
+    Gracefully skips if generator did not complete or has no summary.
+    """
+    verify_cfg = cfg.get('delegation', {}).get('verify', {})
+    should_verify = task.get('verify', verify_cfg.get('enabled', False))
+
+    if not should_verify or generator_result.get('status') != 'completed':
+        return generator_result
+
+    summary = generator_result.get('summary', '')
+    if not summary:
+        return generator_result
+
+    critic_goal = _CRITIC_PROMPT_TEMPLATE.format(
+        goal=task.get('goal', ''),
+        summary=summary[:4000],
+    )
+
+    critic_model = verify_cfg.get('model') or None
+    task_index = generator_result.get('task_index', 0)
+
+    try:
+        critic_child = _build_child_agent(
+            task_index=task_index,
+            goal=critic_goal,
+            context=None,
+            toolsets=['terminal'],
+            model=critic_model,
+            max_iterations=10,
+            parent_agent=parent_agent,
+        )
+        critic_result = _run_single_child(
+            task_index=task_index,
+            goal=critic_goal,
+            child=critic_child,
+            parent_agent=parent_agent,
+        )
+    except Exception as e:
+        logger.debug('Critic subagent failed: %s', e)
+        return generator_result
+
+    critic_summary = critic_result.get('summary', '') or ''
+    if 'VERDICT: valid' in critic_summary:
+        verdict = 'valid'
+    elif 'VERDICT: invalid' in critic_summary:
+        verdict = 'invalid'
+    else:
+        verdict = 'unknown'
+
+    return {
+        **generator_result,
+        'verdict': verdict,
+        'critic_summary': critic_summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Intelligent retry with failure context injection
+# ---------------------------------------------------------------------------
+
+_RETRY_CONTEXT_TEMPLATE = (
+    "PREVIOUS ATTEMPT FAILED.\n\n"
+    "Error: {error}\n\n"
+    "Previous attempt summary: {summary}\n\n"
+    "Please try a different approach. Do not repeat the same mistake."
+)
+
+
+def _run_with_retry(
+    task: Dict[str, Any],
+    parent_agent,
+    child_builder_kwargs: Dict[str, Any],
+    max_retries: int = 0,
+    inject_failure_context: bool = True,
+) -> Dict[str, Any]:
+    """
+    Run a task with intelligent retry on failure.
+    On each retry, injects failure context from the previous attempt.
+    """
+    task_index = child_builder_kwargs.get('task_index', 0)
+    last_result: Optional[Dict[str, Any]] = None
+    current_task = dict(task)
+
+    for attempt in range(max_retries + 1):
+        if attempt > 0 and inject_failure_context and last_result:
+            failure_ctx = _RETRY_CONTEXT_TEMPLATE.format(
+                error=last_result.get('error', 'unknown error'),
+                summary=last_result.get('summary') or 'no summary available',
+            )
+            existing = current_task.get('context') or ''
+            current_task = dict(current_task)
+            current_task['context'] = f"{existing}\n\n{failure_ctx}".strip() if existing else failure_ctx
+
+        kwargs = dict(child_builder_kwargs)
+        kwargs['goal'] = current_task['goal']
+        kwargs['context'] = current_task.get('context')
+        child = _build_child_agent(**kwargs)
+        result = _run_single_child(
+            task_index=task_index,
+            goal=current_task['goal'],
+            child=child,
+            parent_agent=parent_agent,
+        )
+        last_result = result
+
+        if result.get('status') == 'completed':
+            if attempt > 0:
+                result = dict(result)
+                result['retry_count'] = attempt
+            return result
+
+    last_result = dict(last_result)  # type: ignore[arg-type]
+    last_result['retry_count'] = max_retries
+    return last_result
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -491,7 +705,16 @@ def delegate_task(
     memory_mode = cfg.get('delegation', {}).get('memory_access', 'none')
 
     # Blackboard: shared key-value store for sibling subagents in this batch
-    bb = Blackboard() if cfg.get('blackboard', {}).get('enabled', False) else None
+    deleg_cfg = cfg.get('delegation', {})
+    bb = Blackboard() if deleg_cfg.get('blackboard', {}).get('enabled', False) else None
+
+    # DAG: topological sort when dag.enabled=True
+    dag_enabled = deleg_cfg.get('dag', {}).get('enabled', False)
+
+    # Retry config
+    retry_cfg = deleg_cfg.get('retry', {})
+    max_retries = int(retry_cfg.get('max_retries', 0))
+    inject_failure_context = bool(retry_cfg.get('inject_failure_context', True))
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -513,6 +736,13 @@ def delegate_task(
 
     if not task_list:
         return json.dumps({"error": "No tasks provided."})
+
+    # DAG sort (only when enabled -- no-op otherwise)
+    if dag_enabled and len(task_list) > 1:
+        try:
+            task_list = topological_sort(task_list)
+        except ValueError as exc:
+            return json.dumps({"error": f"DAG error: {exc}"})
 
     # Validate each task has a goal
     for i, task in enumerate(task_list):
@@ -556,10 +786,65 @@ def delegate_task(
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
+    # Shared builder kwargs template (task-specific fields overridden per task)
+    _base_builder_kwargs = dict(
+        goal='',  # overridden per task
+        context=None,
+        toolsets=toolsets,
+        model=creds["model"],
+        max_iterations=effective_max_iter,
+        parent_agent=parent_agent,
+        override_provider=creds["provider"],
+        override_base_url=creds["base_url"],
+        override_api_key=creds["api_key"],
+        override_api_mode=creds["api_mode"],
+        memory_mode=memory_mode,
+        skills=None,
+        blackboard=bb,
+    )
+
+    def _run_task(i: int, t: dict) -> Dict[str, Any]:
+        """Run a single task with retry + verify."""
+        # DAG: inject predecessor summaries if dag enabled
+        resolved_task = t
+        if dag_enabled:
+            completed_so_far = {
+                str(r.get('task_index', '')): r for r in results
+            }
+            resolved_task = resolve_deps(t, completed_so_far)
+
+        task_kwargs = dict(_base_builder_kwargs)
+        task_kwargs['task_index'] = i
+        task_kwargs['toolsets'] = t.get('toolsets') or toolsets
+        task_kwargs['skills'] = t.get('skills')
+
+        if max_retries > 0:
+            result = _run_with_retry(
+                task=resolved_task,
+                parent_agent=parent_agent,
+                child_builder_kwargs=task_kwargs,
+                max_retries=max_retries,
+                inject_failure_context=inject_failure_context,
+            )
+        else:
+            task_kwargs['goal'] = resolved_task['goal']
+            task_kwargs['context'] = resolved_task.get('context')
+            child = _build_child_agent(**task_kwargs)
+            child._delegate_saved_tool_names = _parent_tool_names
+            result = _run_single_child(i, resolved_task['goal'], child, parent_agent)
+
+        # Generator-critic: run verify if requested
+        result = _run_with_verify(result, t, parent_agent, cfg)
+        return result
+
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        if max_retries > 0:
+            result = _run_task(0, _t)
+        else:
+            result = _run_single_child(0, _t["goal"], child, parent_agent)
+            result = _run_with_verify(result, _t, parent_agent, cfg)
         results.append(result)
         if callable(on_task_done):
             try:
@@ -574,22 +859,27 @@ def delegate_task(
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
             futures = {}
             for i, t, child in children:
-                future = executor.submit(
-                    _run_single_child,
-                    task_index=i,
-                    goal=t["goal"],
-                    child=child,
-                    parent_agent=parent_agent,
-                )
-                futures[future] = i
+                if max_retries > 0:
+                    future = executor.submit(_run_task, i, t)
+                else:
+                    future = executor.submit(
+                        _run_single_child,
+                        task_index=i,
+                        goal=t["goal"],
+                        child=child,
+                        parent_agent=parent_agent,
+                    )
+                futures[future] = (i, t)
 
             for future in as_completed(futures):
+                _fi, _ft = futures[future]
                 try:
                     entry = future.result()
+                    if max_retries == 0:
+                        entry = _run_with_verify(entry, _ft, parent_agent, cfg)
                 except Exception as exc:
-                    idx = futures[future]
                     entry = {
-                        "task_index": idx,
+                        "task_index": _fi,
                         "status": "error",
                         "summary": None,
                         "error": str(exc),
