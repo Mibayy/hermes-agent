@@ -193,7 +193,7 @@ When `gh` is not available, you can still access the full GitHub API using `curl
 
 ```bash
 # Option 1: Export as env var (preferred — keeps it out of commands)
-export GITHUB_TOKEN="<token>"
+export GITHUB_TOKEN="<your-token>"
 
 # Then use in curl calls:
 curl -s -H "Authorization: token $GITHUB_TOKEN" \
@@ -206,6 +206,9 @@ If git credentials are already configured (via credential.helper store), the tok
 
 ```bash
 # Read from git credential store
+# Check ~/.hermes/.env first (token stored by `hermes setup`)
+grep "^GITHUB_TOKEN=" ~/.hermes/.env 2>/dev/null | cut -d= -f2 | tr -d '\n\r'
+# Fall back to git credential store
 grep "github.com" ~/.git-credentials 2>/dev/null | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|'
 ```
 
@@ -218,6 +221,9 @@ Use this pattern at the start of any GitHub workflow:
 if command -v gh &>/dev/null && gh auth status &>/dev/null; then
   echo "AUTH_METHOD=gh"
 elif [ -n "$GITHUB_TOKEN" ]; then
+  echo "AUTH_METHOD=curl"
+elif [ -f ~/.hermes/.env ] && grep -q "^GITHUB_TOKEN=" ~/.hermes/.env; then
+  export GITHUB_TOKEN=$(grep "^GITHUB_TOKEN=" ~/.hermes/.env | cut -d= -f2 | tr -d '\n\r')
   echo "AUTH_METHOD=curl"
 elif grep -q "github.com" ~/.git-credentials 2>/dev/null; then
   export GITHUB_TOKEN=$(grep "github.com" ~/.git-credentials | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|')
