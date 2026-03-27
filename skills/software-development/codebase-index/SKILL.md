@@ -83,17 +83,21 @@ search_codebase(pattern="contextTokens", file_glob="*.py")
 
 ## Pairs well with hermes-memory
 
-codebase-index and hermes-memory (PR #2692) solve complementary problems:
+codebase-index and hermes-memory (PR #2692) solve complementary problems.
 
-- **codebase-index** keeps code navigation cheap — symbols instead of files,
+hermes-memory is a Hermes plugin (`pip install hermes-memory`) that provides
+structured persistent memory — typed facts (constraints, decisions, values),
+FTS5 search, automatic pressure management, and slash commands like
+`/memory status` and `/memory search <query>`.
+
+- **codebase-index** controls what the agent reads — symbols instead of files,
   so the context stays small during exploration.
-- **hermes-memory** keeps decisions durable — architectural constraints, design
-  choices, and open questions survive context compression and are searchable
-  across turns via FTS5.
+- **hermes-memory** controls what the agent remembers — architectural constraints,
+  design choices, and open questions survive context compression and are
+  searchable across turns.
 
-Running both is the recommended setup for extended development sessions. Neither
-replaces the other: one controls what the agent reads, the other controls what
-the agent remembers.
+Neither replaces the other. Running both is the recommended setup for extended
+development sessions.
 
 ## Pitfalls
 
