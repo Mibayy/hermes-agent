@@ -45,7 +45,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
 ])
 
 MAX_CONCURRENT_CHILDREN = 3
-MAX_DEPTH = 1  # parent (0) -> child attempts to delegate, rejected (1)
+MAX_DEPTH = 2  # default fallback when config is absent
 DEFAULT_MAX_ITERATIONS = 50
 
 
