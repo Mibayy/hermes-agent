@@ -24,6 +24,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
+try:
+    from tools.structured_memory import db as _sm_db_check  # noqa: F401
+    _SM_AVAILABLE = True
+except ImportError:
+    _SM_AVAILABLE = False
+
 
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset([
@@ -35,8 +41,14 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
 ])
 
 MAX_CONCURRENT_CHILDREN = 3
-MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+MAX_DEPTH = 1  # parent (0) -> child attempts to delegate, rejected (1)
 DEFAULT_MAX_ITERATIONS = 50
+
+
+def _get_max_depth() -> int:
+    """Read max delegation depth from config, default MAX_DEPTH."""
+    cfg = _load_config()
+    return int(cfg.get('delegation', {}).get('max_depth', MAX_DEPTH))
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
 
@@ -67,12 +79,24 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
     return "\n".join(parts)
 
 
+_ALWAYS_BLOCKED_TOOLSETS = {'delegation', 'clarify', 'code_execution'}
+
+
+def _compute_child_toolsets(toolsets: list, memory_mode: str = 'none') -> list:
+    """
+    Filter toolsets for a child agent.
+    memory_mode: none | read | read-write
+    'memory' toolset is stripped unless mode is read/read-write AND _SM_AVAILABLE.
+    """
+    blocked = set(_ALWAYS_BLOCKED_TOOLSETS)
+    if memory_mode == 'none' or not _SM_AVAILABLE:
+        blocked.add('memory')
+    return [t for t in toolsets if t not in blocked]
+
+
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that contain only blocked tools."""
-    blocked_toolset_names = {
-        "delegation", "clarify", "memory", "code_execution",
-    }
-    return [t for t in toolsets if t not in blocked_toolset_names]
+    """Remove toolsets that contain only blocked tools. Backward-compat wrapper."""
+    return _compute_child_toolsets(toolsets, 'none')
 
 
 def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
@@ -160,6 +184,7 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    memory_mode: str = 'none',
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -177,11 +202,11 @@ def _build_child_agent(
     parent_toolsets = set(getattr(parent_agent, "enabled_toolsets", None) or DEFAULT_TOOLSETS)
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks
-        child_toolsets = _strip_blocked_tools([t for t in toolsets if t in parent_toolsets])
+        child_toolsets = _compute_child_toolsets([t for t in toolsets if t in parent_toolsets], memory_mode)
     elif parent_agent and getattr(parent_agent, "enabled_toolsets", None):
-        child_toolsets = _strip_blocked_tools(parent_agent.enabled_toolsets)
+        child_toolsets = _compute_child_toolsets(parent_agent.enabled_toolsets, memory_mode)
     else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+        child_toolsets = _compute_child_toolsets(DEFAULT_TOOLSETS, memory_mode)
 
     child_prompt = _build_child_system_prompt(goal, context)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
@@ -419,10 +444,10 @@ def delegate_task(
 
     # Depth limit
     depth = getattr(parent_agent, '_delegate_depth', 0)
-    if depth >= MAX_DEPTH:
+    if depth >= _get_max_depth():
         return json.dumps({
             "error": (
-                f"Delegation depth limit reached ({MAX_DEPTH}). "
+                f"Delegation depth limit reached ({_get_max_depth()}). "
                 "Subagents cannot spawn further subagents."
             )
         })
