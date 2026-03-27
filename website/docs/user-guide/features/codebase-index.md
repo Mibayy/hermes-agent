@@ -80,7 +80,7 @@ re-indexed between sessions.
 Once configured, Hermes has access to:
 
 | Tool | What it does |
-|------|--------------|
+|------|--------------| 
 | `search_codebase` | Regex search across all indexed files |
 | `find_symbol` | Locate a function/class by name — returns file, line, preview |
 | `get_function_source` | Full source of a function without reading the whole file |
@@ -119,3 +119,29 @@ hermes> load the codebase-index skill
 ```
 
 See [Skills](../skills/) for how bundled skills work.
+
+## Pairs well with hermes-memory
+
+codebase-index and [hermes-memory](https://github.com/NousResearch/hermes-agent/pull/2692)
+solve complementary problems in long coding sessions:
+
+- **codebase-index** keeps code navigation cheap — the agent reads symbols,
+  not files, so the context stays small during exploration.
+- **hermes-memory** keeps decisions durable — architectural choices, constraints,
+  and open questions survive context compression and stay queryable across turns.
+
+Together they address the two main ways long sessions degrade: context bloat
+from reading too much code, and decision drift from forgetting what was agreed.
+Running both is the recommended setup for extended development work.
+
+```yaml
+mcp_servers:
+  codebase-index:
+    command: ~/.local/mcp-codebase-index-venv/bin/mcp-codebase-index
+    env:
+      WORKSPACE_ROOTS: /path/to/project
+    timeout: 120
+    connect_timeout: 30
+  hermes-memory:
+    command: hermes-memory
+```
