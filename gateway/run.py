@@ -2854,6 +2854,7 @@ class GatewayRunner:
 
         # Resolve current provider from config
         current_provider = "openrouter"
+        config_base_url = None
         config_path = _hermes_home / 'config.yaml'
         try:
             if config_path.exists():
@@ -2862,20 +2863,44 @@ class GatewayRunner:
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
                     current_provider = model_cfg.get("provider", current_provider)
+                    config_base_url = model_cfg.get("base_url") or None
         except Exception:
             pass
 
         current_provider = normalize_provider(current_provider)
         if current_provider == "auto":
+            # Check custom providers by name in config.yaml
             try:
-                from hermes_cli.auth import resolve_provider as _resolve_provider
-                current_provider = _resolve_provider(current_provider)
+                from hermes_cli.config import load_config as _load_config
+                full_cfg = _load_config()
+                custom_providers = full_cfg.get("custom_providers") or []
+                current_model = ""
+                try:
+                    current_model = (full_cfg.get("model") or {}).get("default", "") or ""
+                except Exception:
+                    pass
+                for cp in custom_providers:
+                    if isinstance(cp, dict) and cp.get("name") and current_model:
+                        cp_name = cp["name"]
+                        if current_model.startswith(f"{cp_name}/") or current_model.startswith(f"{cp_name}:"):
+                            current_provider = cp_name
+                            break
             except Exception:
-                current_provider = "openrouter"
+                pass
 
-        # Detect custom endpoint
-        if current_provider == "openrouter" and os.getenv("OPENAI_BASE_URL", "").strip():
-            current_provider = "custom"
+            if current_provider == "auto":
+                try:
+                    from hermes_cli.auth import resolve_provider as _resolve_provider
+                    current_provider = _resolve_provider(current_provider)
+                except Exception:
+                    current_provider = "openrouter"
+
+        # Detect custom endpoint: config.yaml base_url or OPENAI_BASE_URL env var
+        # take precedence over auto-resolved openrouter when the user explicitly
+        # configured a custom endpoint
+        if current_provider == "openrouter":
+            if config_base_url or os.getenv("OPENAI_BASE_URL", "").strip():
+                current_provider = "custom"
 
         current_label = _PROVIDER_LABELS.get(current_provider, current_provider)
 

@@ -71,8 +71,18 @@ def _effective_provider_label() -> str:
     except AuthError:
         effective = requested or "auto"
 
-    if effective == "openrouter" and get_env_value("OPENAI_BASE_URL"):
-        effective = "custom"
+    if effective == "openrouter":
+        # Check config.yaml base_url in addition to OPENAI_BASE_URL env var
+        config_base_url = None
+        try:
+            cfg = load_config()
+            model_cfg = cfg.get("model") or {}
+            if isinstance(model_cfg, dict):
+                config_base_url = model_cfg.get("base_url") or None
+        except Exception:
+            pass
+        if config_base_url or get_env_value("OPENAI_BASE_URL"):
+            effective = "custom"
 
     return provider_label(effective)
 
