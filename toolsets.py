@@ -64,6 +64,8 @@ _HERMES_CORE_TOOLS = [
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # OpenViking context database (gated on server availability via check_fn)
+    "viking_search", "viking_read", "viking_browse",
 ]
 
 
@@ -202,6 +204,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "openviking": {
+        "description": "OpenViking self-hosted memory database — semantic search over memories, resources, and skills",
+        "tools": ["viking_search", "viking_read", "viking_browse"],
+        "includes": []
+    },
+
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
@@ -281,6 +289,8 @@ TOOLSETS = {
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
             # Honcho memory tools (gated on honcho being active via check_fn)
             "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
+            # OpenViking context database (gated on server availability via check_fn)
+            "viking_search", "viking_read", "viking_browse",
         ],
         "includes": []
     },
