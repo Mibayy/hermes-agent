@@ -611,14 +611,31 @@ def _read_main_model() -> str:
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str]]:
     """Resolve the active custom/main endpoint the same way the main CLI does.
 
-    This covers both env-driven OPENAI_BASE_URL setups and config-saved custom
-    endpoints where the base URL lives in config.yaml instead of the live
-    environment.
+    Uses the same provider resolution path as the main agent (reading provider
+    from config.yaml / env), so named custom providers (e.g. ``custom:local``)
+    are honoured instead of being skipped by a hardcoded ``requested="custom"``.
+
+    Falls back to an explicit ``requested="custom"`` pass only when the active
+    provider is not itself a custom endpoint, preserving existing behaviour for
+    env-driven OPENAI_BASE_URL setups.
     """
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import (
+            resolve_runtime_provider,
+            resolve_requested_provider,
+        )
 
-        runtime = resolve_runtime_provider(requested="custom")
+        # First attempt: resolve using the same provider the main agent uses.
+        # This ensures named custom providers stored in config.yaml are picked
+        # up instead of being bypassed.
+        active_requested = resolve_requested_provider()
+        runtime = resolve_runtime_provider(requested=active_requested)
+
+        # If the active provider resolved to a non-custom endpoint (e.g. nous,
+        # openrouter) there is no custom endpoint to mirror.  Fall back to an
+        # explicit custom pass so env-driven OPENAI_BASE_URL setups still work.
+        if runtime.get("provider") != "custom":
+            runtime = resolve_runtime_provider(requested="custom")
     except Exception as exc:
         logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
         return None, None
@@ -632,10 +649,17 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str]]:
 
     custom_base = custom_base.strip().rstrip("/")
     if "openrouter.ai" in custom_base.lower():
-        # requested='custom' falls back to OpenRouter when no custom endpoint is
-        # configured. Treat that as "no custom endpoint" for auxiliary routing.
+        # Treat an OpenRouter result as "no custom endpoint" for auxiliary
+        # routing — resolve_runtime_provider falls back to OpenRouter when
+        # nothing else is configured.
         return None, None
 
+    source = runtime.get("source", "unknown")
+    logger.debug(
+        "Auxiliary client: resolved custom runtime via source=%r endpoint=%s",
+        source,
+        custom_base,
+    )
     return custom_base, custom_key.strip()
 
 

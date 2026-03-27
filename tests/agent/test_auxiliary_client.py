@@ -988,3 +988,129 @@ class TestAuxiliaryMaxTokensParam:
              patch("agent.auxiliary_client._read_codex_access_token", return_value=None):
             result = auxiliary_max_tokens_param(1024)
         assert result == {"max_tokens": 1024}
+
+
+class TestResolveCustomRuntime:
+    """_resolve_custom_runtime() should mirror the main agent's provider choice."""
+
+    def test_named_custom_provider_used_when_active(self, monkeypatch):
+        """When the active provider is a named custom one, auxiliary should reuse it."""
+        from agent.auxiliary_client import _resolve_custom_runtime
+
+        named_runtime = {
+            "provider": "custom",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "sk-local",
+            "source": "custom_provider:local",
+        }
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_requested_provider",
+            return_value="custom:local",
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=named_runtime,
+        ) as mock_resolve:
+            base, key = _resolve_custom_runtime()
+
+        assert base == "http://localhost:11434/v1"
+        assert key == "sk-local"
+        # Should have resolved with the active provider name, not hardcoded "custom"
+        mock_resolve.assert_called_once_with(requested="custom:local")
+
+    def test_falls_back_to_explicit_custom_when_active_is_non_custom(self, monkeypatch):
+        """When the active provider is nous/openrouter, fall back to requested=custom."""
+        from agent.auxiliary_client import _resolve_custom_runtime
+
+        nous_runtime = {
+            "provider": "nous",
+            "base_url": "https://inference.nous.ai/v1",
+            "api_key": "nous-key",
+            "source": "portal",
+        }
+        custom_runtime = {
+            "provider": "custom",
+            "base_url": "http://localhost:8080/v1",
+            "api_key": "sk-env",
+            "source": "env",
+        }
+
+        call_count = {"n": 0}
+
+        def fake_resolve(*, requested):
+            call_count["n"] += 1
+            if requested == "nous":
+                return nous_runtime
+            return custom_runtime
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_requested_provider",
+            return_value="nous",
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=fake_resolve,
+        ):
+            base, key = _resolve_custom_runtime()
+
+        assert base == "http://localhost:8080/v1"
+        assert key == "sk-env"
+        assert call_count["n"] == 2  # first with "nous", then fallback with "custom"
+
+    def test_credential_source_consistent_with_active_runtime(self, monkeypatch):
+        """Auxiliary credentials must come from the same source as the main runtime."""
+        from agent.auxiliary_client import _resolve_custom_runtime
+
+        active_runtime = {
+            "provider": "custom",
+            "base_url": "https://custom.example.com/v1",
+            "api_key": "sk-config-saved",
+            "source": "custom_provider:myserver",
+        }
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_requested_provider",
+            return_value="custom:myserver",
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=active_runtime,
+        ):
+            base, key = _resolve_custom_runtime()
+
+        assert base == "https://custom.example.com/v1"
+        assert key == "sk-config-saved"
+
+    def test_openrouter_result_treated_as_no_custom_endpoint(self, monkeypatch):
+        """If active provider resolves to OpenRouter, auxiliary should see no endpoint."""
+        from agent.auxiliary_client import _resolve_custom_runtime
+
+        or_runtime = {
+            "provider": "custom",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "or-key",
+            "source": "env",
+        }
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_requested_provider",
+            return_value="auto",
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=or_runtime,
+        ):
+            base, key = _resolve_custom_runtime()
+
+        assert base is None
+        assert key is None
+
+    def test_resolution_exception_returns_none(self, monkeypatch):
+        """Any exception during resolution must be swallowed and return (None, None)."""
+        from agent.auxiliary_client import _resolve_custom_runtime
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_requested_provider",
+            side_effect=RuntimeError("config unreadable"),
+        ):
+            base, key = _resolve_custom_runtime()
+
+        assert base is None
+        assert key is None
