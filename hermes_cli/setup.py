@@ -1057,6 +1057,16 @@ def setup_model_provider(config: dict):
         # and custom_providers. Keep selected_provider = "custom" so
         # the model selection step below is skipped (line 1631 check)
         # but vision and TTS setup still run.
+        #
+        # IMPORTANT: _model_flow_custom writes to disk via its own fresh
+        # load_config() + save_config() call — the outer `config` dict is
+        # NOT updated in-place.  If we don't reload here, the final
+        # save_config(config) at the bottom of run_setup_wizard() will
+        # overwrite what _model_flow_custom just wrote, losing
+        # model.provider and model.base_url from config.yaml (issue #3415).
+        from hermes_cli.config import load_config as _reload_config
+        config.clear()
+        config.update(_reload_config())
 
     elif provider_idx == 4:  # Z.AI / GLM
         selected_provider = "zai"

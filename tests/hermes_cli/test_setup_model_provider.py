@@ -459,6 +459,61 @@ def test_setup_summary_marks_codex_auth_as_vision_available(tmp_path, monkeypatc
     assert "missing OPENROUTER_API_KEY" in output
 
 
+def test_custom_setup_wizard_persists_provider_in_config(tmp_path, monkeypatch):
+    """hermes setup (custom endpoint) must not clobber model.provider after _model_flow_custom.
+
+    Regression test for issue #3415: run_setup_wizard() called save_config(config) at
+    the end using the outer `config` dict that was never updated by _model_flow_custom
+    (which writes via its own fresh load_config() / save_config() cycle), causing
+    model.provider and model.base_url to be stripped from config.yaml.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+
+    config = load_config()
+
+    def fake_prompt_choice(question, choices, default=0):
+        if question == "Select your inference provider:":
+            return 3  # Custom endpoint
+        if question == "Configure vision:":
+            return len(choices) - 1  # Skip
+        tts_idx = _maybe_keep_current_tts(question, choices)
+        if tts_idx is not None:
+            return tts_idx
+        raise AssertionError(f"Unexpected prompt_choice call: {question!r}")
+
+    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
+    monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *a, **kw: False)
+    monkeypatch.setattr("hermes_cli.auth.detect_external_credentials", lambda: [])
+    monkeypatch.setattr("hermes_cli.main._save_custom_provider", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "hermes_cli.models.probe_api_models",
+        lambda api_key, base_url: {"models": ["m"], "probed_url": base_url + "/models"},
+    )
+
+    input_values = iter([
+        "https://custom.example/v1",  # base URL
+        "custom-api-key",              # API key
+        "my-model",                    # model name
+        "",                            # context_length (blank = auto-detect)
+    ])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(input_values))
+
+    setup_model_provider(config)
+    save_config(config)
+
+    reloaded = load_config()
+    model = reloaded.get("model", {})
+    assert isinstance(model, dict), "model should be a dict after custom setup"
+    assert model.get("provider") == "custom", (
+        "model.provider was lost — run_setup_wizard() clobbered _model_flow_custom's write"
+    )
+    assert model.get("base_url") == "https://custom.example/v1", (
+        "model.base_url was lost — run_setup_wizard() clobbered _model_flow_custom's write"
+    )
+    assert model.get("default") == "my-model"
+
+
 def test_setup_summary_marks_anthropic_auth_as_vision_available(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _clear_provider_env(monkeypatch)
