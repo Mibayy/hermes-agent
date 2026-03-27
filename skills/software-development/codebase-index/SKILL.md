@@ -81,6 +81,31 @@ search_codebase(pattern="contextTokens", file_glob="*.py")
 → returns: file, line number, matching line — no noise
 ```
 
+## Pairs well with delegate_task
+
+When used with `delegate_task` (PR #3387), pass `skills=["codebase-index"]` in
+a task to give the subagent index access. The subagent gets the full skill
+content injected into its system prompt and will call `search_codebase` /
+`find_symbol` instead of grep/cat -- the token savings apply inside delegated
+tasks too.
+
+```json
+{
+  "tasks": [
+    {
+      "goal": "Find all callers of send_message and check for missing error handling",
+      "skills": ["codebase-index"],
+      "toolsets": ["terminal", "file"]
+    }
+  ]
+}
+```
+
+This requires mcp-codebase-index to be running in the parent session. The MCP
+tools are not available inside the subagent's isolated terminal, but the skill
+content guides the subagent's reasoning about what to query via the parent's
+tool proxy.
+
 ## Pairs well with structured memory
 
 codebase-index works well alongside the native structured memory toolset
