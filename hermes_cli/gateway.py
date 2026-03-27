@@ -434,13 +434,20 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         resolved_node_dir = str(Path(resolved_node).resolve().parent)
         if resolved_node_dir not in path_entries:
             path_entries.append(resolved_node_dir)
-    path_entries.extend(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
-    sane_path = ":".join(path_entries)
 
     hermes_home = str(get_hermes_home().resolve())
 
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
+        user_local_bin = str(Path(home_dir) / ".local" / "bin")
+        path_entries.append(user_local_bin)
+    else:
+        path_entries.append(str(Path.home() / ".local" / "bin"))
+
+    path_entries.extend(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
+    sane_path = ":".join(path_entries)
+
+    if system:
         return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
