@@ -287,6 +287,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Creation timestamps for orphaned-run TTL sweep
+        self._run_streams_created: Dict[str, float] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1236,9 +1238,10 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         run_id = f"run_{uuid.uuid4().hex}"
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         self._run_streams[run_id] = q
+        self._run_streams_created[run_id] = time.time()
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
@@ -1289,7 +1292,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     }
                     return r, u
 
-                result, usage = await asyncio.get_event_loop().run_in_executor(None, _run_sync)
+                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 q.put_nowait({
                     "event": "run.completed",
@@ -1316,7 +1319,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
 
-        asyncio.ensure_future(_run_and_close())
+        task = asyncio.create_task(_run_and_close())
+        try:
+            self._background_tasks.add(task)
+        except TypeError:
+            pass
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response({"run_id": run_id, "status": "started"}, status=202)
 
@@ -1350,21 +1359,45 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             while True:
-                event = await asyncio.wait_for(q.get(), timeout=30.0)
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    continue
                 if event is None:
                     # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
                 payload = f"data: {json.dumps(event)}\n\n"
                 await response.write(payload.encode())
-        except asyncio.TimeoutError:
-            await response.write(b": keepalive\n\n")
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
             self._run_streams.pop(run_id, None)
+            self._run_streams_created.pop(run_id, None)
 
         return response
+
+    # ------------------------------------------------------------------
+    # Orphaned run sweep
+    # ------------------------------------------------------------------
+
+    _RUN_STREAM_TTL = 300  # seconds
+
+    async def _sweep_orphaned_runs(self) -> None:
+        """Periodically clean up run streams that were never consumed."""
+        while True:
+            await asyncio.sleep(60)
+            now = time.time()
+            stale = [
+                run_id
+                for run_id, created_at in list(self._run_streams_created.items())
+                if now - created_at > self._RUN_STREAM_TTL
+            ]
+            for run_id in stale:
+                logger.debug("[api_server] sweeping orphaned run %s", run_id)
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -1398,6 +1431,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            # Start background sweep to clean up orphaned (unconsumed) run streams
+            sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
+            try:
+                self._background_tasks.add(sweep_task)
+            except TypeError:
+                pass
+            if hasattr(sweep_task, "add_done_callback"):
+                sweep_task.add_done_callback(self._background_tasks.discard)
 
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
