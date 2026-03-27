@@ -123,7 +123,13 @@ See [Skills](../skills/) for how bundled skills work.
 ## Pairs well with hermes-memory
 
 codebase-index and [hermes-memory](https://github.com/NousResearch/hermes-agent/pull/2692)
-solve complementary problems in long coding sessions:
+solve complementary problems in long coding sessions.
+
+hermes-memory is a Hermes plugin (installed via `pip install hermes-memory`,
+configured as a plugin in `~/.hermes/plugins/`) that provides structured
+persistent memory across sessions — typed facts (constraints, decisions, values),
+FTS5 search, automatic pressure management, and slash commands like
+`/memory status` and `/memory search`.
 
 - **codebase-index** keeps code navigation cheap — the agent reads symbols,
   not files, so the context stays small during exploration.
@@ -133,15 +139,3 @@ solve complementary problems in long coding sessions:
 Together they address the two main ways long sessions degrade: context bloat
 from reading too much code, and decision drift from forgetting what was agreed.
 Running both is the recommended setup for extended development work.
-
-```yaml
-mcp_servers:
-  codebase-index:
-    command: ~/.local/mcp-codebase-index-venv/bin/mcp-codebase-index
-    env:
-      WORKSPACE_ROOTS: /path/to/project
-    timeout: 120
-    connect_timeout: 30
-  hermes-memory:
-    command: hermes-memory
-```
