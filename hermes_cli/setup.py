@@ -617,7 +617,9 @@ def _print_setup_summary(config: dict, hermes_home):
 
     # TTS — show configured provider
     tts_provider = config.get("tts", {}).get("provider", "edge")
-    if tts_provider == "elevenlabs" and get_env_value("ELEVENLABS_API_KEY"):
+    if tts_provider == "none":
+        tool_status.append(("Text-to-Speech", False, "disabled — run 'hermes setup tts' to enable"))
+    elif tts_provider == "elevenlabs" and get_env_value("ELEVENLABS_API_KEY"):
         tool_status.append(("Text-to-Speech (ElevenLabs)", True, None))
     elif tts_provider == "openai" and get_env_value("VOICE_TOOLS_OPENAI_KEY"):
         tool_status.append(("Text-to-Speech (OpenAI)", True, None))
@@ -1885,6 +1887,7 @@ def _setup_tts_provider(config: dict):
         "elevenlabs": "ElevenLabs",
         "openai": "OpenAI TTS",
         "neutts": "NeuTTS",
+        "none": "None (disabled)",
     }
     current_label = provider_labels.get(current_provider, current_provider)
 
@@ -1898,14 +1901,15 @@ def _setup_tts_provider(config: dict):
         "ElevenLabs (premium quality, needs API key)",
         "OpenAI TTS (good quality, needs API key)",
         "NeuTTS (local on-device, free, ~300MB model download)",
+        "None (disable TTS entirely)",
         f"Keep current ({current_label})",
     ]
     idx = prompt_choice("Select TTS provider:", choices, len(choices) - 1)
 
-    if idx == 4:  # Keep current
+    if idx == 5:  # Keep current
         return
 
-    providers = ["edge", "elevenlabs", "openai", "neutts"]
+    providers = ["edge", "elevenlabs", "openai", "neutts", "none"]
     selected = providers[idx]
 
     if selected == "neutts":

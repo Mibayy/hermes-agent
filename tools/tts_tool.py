@@ -372,6 +372,12 @@ def text_to_speech_tool(
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
 
+    if provider == "none":
+        return json.dumps({
+            "success": False,
+            "error": "TTS is disabled (tts.provider = none). Run 'hermes setup tts' to enable a provider.",
+        }, ensure_ascii=False)
+
     # Detect platform from gateway env var to choose the best output format.
     # Telegram voice bubbles require Opus (.ogg); OpenAI and ElevenLabs can
     # produce Opus natively (no ffmpeg needed).  Edge TTS always outputs MP3
@@ -526,6 +532,9 @@ def check_tts_requirements() -> bool:
     Returns:
         bool: True if at least one provider can work.
     """
+    tts_config = _load_tts_config()
+    if _get_provider(tts_config) == "none":
+        return False
     try:
         _import_edge_tts()
         return True
