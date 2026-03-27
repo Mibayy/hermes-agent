@@ -1069,7 +1069,12 @@ DELEGATE_TASK_SCHEMA = {
         "- Subagents CANNOT call: delegate_task, clarify, memory, send_message, "
         "execute_code.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
-        "- Results are always returned as an array, one entry per task."
+        "- Results are always returned as an array, one entry per task.\n\n"
+        "V2 TASK FIELDS (opt-in):\n"
+        "- skills: list of skill names to inject into child system prompt\n"
+        "- verify: true to run a critic subagent after the generator\n"
+        "- depends_on: list of task ids this task depends on (requires dag.enabled in config)\n"
+        "- id: string identifier used by depends_on"
     ),
     "parameters": {
         "type": "object",
