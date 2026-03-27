@@ -680,7 +680,11 @@ class TestVisionClientFallback:
         """
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:1234/v1")
         monkeypatch.setenv("OPENAI_API_KEY", "local-key")
+        # Set the active provider explicitly so _resolve_custom_runtime() uses the
+        # env-driven OPENAI_BASE_URL path and does not fall through to _try_anthropic.
+        monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "custom")
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+             patch("agent.anthropic_adapter.build_anthropic_client", return_value=None), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             client, model = get_vision_auxiliary_client()
         assert client is not None  # Custom endpoint picked up as fallback
