@@ -40,7 +40,8 @@ def test_notes_section():
 
 def test_unknown_keys_rendered():
     result = _format_structured_context({'custom_key': ['val1', 'val2']})
-    assert 'Custom_key' in result or 'custom_key' in result.lower()
+    # key.replace('_', ' ').title() -> 'Custom Key'
+    assert 'Custom Key' in result
     assert 'val1' in result
 
 

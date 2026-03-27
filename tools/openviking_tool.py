@@ -76,7 +76,10 @@ def viking_search(
             payload["target_uri"] = target_uri
 
         r = c.post(endpoint, json=payload)
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            return json.dumps({"error": f"Non-JSON response from server (HTTP {r.status_code}): {r.text[:200]}"})
 
         raw_result = data.get("result", {})
 
@@ -143,7 +146,10 @@ def viking_read(
         # Individual files: use grep to get full content
         r = c.post("/api/v1/search/grep", json={"pattern": ".", "uri": uri, "recursive": False})
         if r.status_code == 200:
-            data = r.json()
+            try:
+                data = r.json()
+            except Exception:
+                return json.dumps({"error": f"Non-JSON response from server (HTTP {r.status_code})"})
             matches = data.get("result", {})
             if isinstance(matches, dict):
                 matches = matches.get("matches", [])

@@ -1,4 +1,5 @@
 """DAG resolver for delegate_task -- topological sort and dependency injection."""
+from collections import deque
 from typing import Any, Dict, List, Optional
 
 
@@ -29,10 +30,10 @@ def topological_sort(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             adj[dep].append(tid)
             in_degree[tid] += 1
 
-    queue = [tid for tid, deg in in_degree.items() if deg == 0]
+    queue = deque(tid for tid, deg in in_degree.items() if deg == 0)
     sorted_ids: List[str] = []
     while queue:
-        node = queue.pop(0)
+        node = queue.popleft()
         sorted_ids.append(node)
         for neighbor in adj[node]:
             in_degree[neighbor] -= 1
