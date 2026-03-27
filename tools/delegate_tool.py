@@ -23,7 +23,7 @@ import os
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 try:
     from tools.structured_memory import db as _sm_db_check  # noqa: F401
@@ -77,15 +77,73 @@ def _load_skill_content(name: str) -> str | None:
     return None
 
 
-def _build_child_system_prompt(goal: str, context: Optional[str] = None, skills: list | None = None, blackboard: 'Blackboard | None' = None) -> str:
+def _format_structured_context(context: Union[str, Dict[str, Any]]) -> str:
+    """
+    Format a context value for injection into a child system prompt.
+
+    Accepts either a plain string or a typed dict with any of:
+      files: list[str]      -- file paths relevant to the task
+      facts: list[str]      -- factual statements about the codebase/domain
+      constraints: list[str] -- hard constraints the subagent must respect
+      notes: str            -- freeform additional context
+
+    Any unrecognised key is rendered as-is under its name.
+    """
+    if isinstance(context, str):
+        return context.strip()
+
+    if not isinstance(context, dict):
+        return str(context).strip()
+
+    sections: list[str] = []
+
+    if 'files' in context and context['files']:
+        files = context['files']
+        sections.append('Relevant files:\n' + '\n'.join(f'  - {f}' for f in files))
+
+    if 'facts' in context and context['facts']:
+        facts = context['facts']
+        sections.append('Known facts:\n' + '\n'.join(f'  - {f}' for f in facts))
+
+    if 'constraints' in context and context['constraints']:
+        constraints = context['constraints']
+        sections.append('Constraints (must be respected):\n' + '\n'.join(f'  - {c}' for c in constraints))
+
+    if 'notes' in context and context['notes']:
+        sections.append(f"Notes:\n{context['notes']}")
+
+    # Render any other keys verbatim
+    known = {'files', 'facts', 'constraints', 'notes'}
+    for key, val in context.items():
+        if key in known:
+            continue
+        if isinstance(val, list):
+            sections.append(f'{key.capitalize()}:\n' + '\n'.join(f'  - {v}' for v in val))
+        else:
+            sections.append(f'{key.capitalize()}:\n{val}')
+
+    return '\n\n'.join(sections)
+
+
+def _build_child_system_prompt(
+    goal: str,
+    context: Union[str, Dict[str, Any], None] = None,
+    skills: list | None = None,
+    blackboard: 'Blackboard | None' = None,
+    hot_facts: Optional[str] = None,
+) -> str:
     """Build a focused system prompt for a child agent."""
     parts = [
         "You are a focused subagent working on a specific delegated task.",
         "",
         f"YOUR TASK:\n{goal}",
     ]
-    if context and context.strip():
-        parts.append(f"\nCONTEXT:\n{context}")
+    if hot_facts and hot_facts.strip():
+        parts.append(f"\nPARENT MEMORY (read-only, do not modify):\n{hot_facts}")
+    if context is not None:
+        formatted = _format_structured_context(context)
+        if formatted:
+            parts.append(f"\nCONTEXT:\n{formatted}")
     if skills:
         skill_sections = []
         for skill_name in skills:
@@ -240,7 +298,8 @@ def _build_child_agent(
     else:
         child_toolsets = _compute_child_toolsets(DEFAULT_TOOLSETS, memory_mode)
 
-    child_prompt = _build_child_system_prompt(goal, context, skills=skills, blackboard=blackboard)
+    hot_facts = _get_parent_hot_facts(parent_agent) if memory_mode in ('read', 'read-write') else None
+    child_prompt = _build_child_system_prompt(goal, context, skills=skills, blackboard=blackboard, hot_facts=hot_facts)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -281,7 +340,7 @@ def _build_child_agent(
         log_prefix=f"[subagent-{task_index}]",
         platform=parent_agent.platform,
         skip_context_files=True,
-        skip_memory=(memory_mode == 'none'),
+        skip_memory=(memory_mode == 'none'),  # read/read-write: init memory so tools function
         clarify_callback=None,
         session_db=getattr(parent_agent, '_session_db', None),
         providers_allowed=parent_agent.providers_allowed,
@@ -457,6 +516,28 @@ def _run_single_child(
 # ---------------------------------------------------------------------------
 # Semantic dedup cache (graceful no-op without structured memory)
 # ---------------------------------------------------------------------------
+
+def _get_parent_hot_facts(parent_agent) -> Optional[str]:
+    """
+    Extract hot facts from the parent agent's memory store.
+    Returns a formatted string for injection into the child system prompt,
+    or None if memory is not loaded / structured memory unavailable.
+    """
+    store = getattr(parent_agent, '_memory_store', None)
+    if store is None:
+        return None
+    try:
+        parts = []
+        mem_block = store.format_for_system_prompt('memory')
+        if mem_block:
+            parts.append(mem_block)
+        user_block = store.format_for_system_prompt('user')
+        if user_block:
+            parts.append(user_block)
+        return '\n'.join(parts) if parts else None
+    except Exception:
+        return None
+
 
 def _sm_search_goal(goal: str, limit: int = 3) -> list:
     """Search structured memory for facts matching this goal. Returns [] if unavailable."""
