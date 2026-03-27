@@ -4,7 +4,7 @@ sidebar_position: 12
 
 # Codebase Index
 
-mcp-codebase-index is a community MCP server that builds a structural index
+[mcp-codebase-index](https://github.com/Mibayy/mcp-codebase-index) is a community MCP server that builds a structural index
 of your codebase — functions, classes, imports, and dependency graphs — so
 Hermes can answer code questions without reading entire files.
 
