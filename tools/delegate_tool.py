@@ -917,7 +917,7 @@ def delegate_task(
         task_kwargs['toolsets'] = t.get('toolsets') or toolsets
         task_kwargs['skills'] = t.get('skills')
 
-        if max_retries > 0:
+        if False:  # retry disabled
             result = _run_with_retry(
                 task=resolved_task,
                 parent_agent=parent_agent,
@@ -933,17 +933,17 @@ def delegate_task(
             result = _run_single_child(i, resolved_task['goal'], child, parent_agent)
 
         # Generator-critic: run verify if requested
-        result = _run_with_verify(result, t, parent_agent, cfg)
+        # result = _run_with_verify(result, t, parent_agent, cfg)
         return result
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        if max_retries > 0:
+        if False:  # retry disabled (teknium feedback #3387)
             result = _run_task(0, _t)
         else:
             result = _run_single_child(0, _t["goal"], child, parent_agent)
-            result = _run_with_verify(result, _t, parent_agent, cfg)
+            # result = _run_with_verify(result, _t, parent_agent, cfg)
         with _results_lock:
             _completed_by_id[str(result.get('task_index', 0))] = result
         results.append(result)
@@ -960,7 +960,7 @@ def delegate_task(
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
             futures = {}
             for i, t, child in children:
-                if max_retries > 0:
+                if False:  # retry disabled
                     future = executor.submit(_run_task, i, t)
                 else:
                     future = executor.submit(
@@ -977,7 +977,8 @@ def delegate_task(
                 try:
                     entry = future.result()
                     if max_retries == 0:
-                        entry = _run_with_verify(entry, _ft, parent_agent, cfg)
+                        # entry = _run_with_verify(entry, _ft, parent_agent, cfg)
+                        pass
                 except Exception as exc:
                     entry = {
                         "task_index": _fi,
@@ -1175,8 +1176,6 @@ DELEGATE_TASK_SCHEMA = {
         "- Results are always returned as an array, one entry per task.\n\n"
         "V2 TASK FIELDS (opt-in):\n"
         "- skills: list of skill names to inject into child system prompt\n"
-        "- verify: true to run a critic subagent after the generator\n"
-        "- depends_on: list of task ids this task depends on (requires dag.enabled in config)\n"
         "- id: string identifier used by depends_on"
     ),
     "parameters": {
