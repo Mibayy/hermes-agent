@@ -34,6 +34,7 @@ except ImportError:
 
 from tools.delegate_blackboard import Blackboard
 from tools.delegate_dag import topological_sort, resolve_deps
+from tools.mcp_tool import set_subagent_mcp_guard
 
 
 # Tools that children must never have access to
@@ -390,6 +391,9 @@ def _run_single_child(
                                 list(model_tools._last_resolved_tool_names))
 
     try:
+        # Activate MCP workspace guard: blocks set_project_root / switch_project
+        # / reindex for this thread so subagents cannot corrupt the shared index.
+        set_subagent_mcp_guard(True)
         result = child.run_conversation(user_message=goal)
 
         # Flush any remaining batched progress to gateway
@@ -496,6 +500,9 @@ def _run_single_child(
         }
 
     finally:
+        # Deactivate MCP workspace guard for this thread.
+        set_subagent_mcp_guard(False)
+
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools

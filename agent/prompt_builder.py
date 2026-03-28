@@ -156,6 +156,26 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+DELEGATION_GUIDANCE = (
+    "# Delegation strategy\n"
+    "You are a manager agent. For implementation tasks with 3 or more distinct steps, "
+    "decompose the work and delegate to subagents via delegate_task rather than doing "
+    "it yourself. You plan, coordinate, and synthesize — subagents execute.\n\n"
+    "Delegate when:\n"
+    "- Implementing a feature (design + code + tests = 3 subtasks minimum)\n"
+    "- Multiple independent files or modules need changes\n"
+    "- The task has clear sequential dependencies (use depends_on for DAG mode)\n"
+    "- You would need 5+ tool calls to do it yourself\n\n"
+    "Do NOT delegate:\n"
+    "- Quick lookups, single-file reads, short answers\n"
+    "- Iterative debugging where you need to see each intermediate result\n"
+    "- Tasks where the user is waiting for a direct reply\n\n"
+    "When delegating: write a precise goal per subtask, include all relevant context "
+    "(file paths, conventions, constraints), and pass applicable skills. "
+    "Your final response synthesizes the subagent summaries into a coherent answer "
+    "for the user — do not just paste the raw JSON."
+)
+
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
