@@ -18,7 +18,6 @@ Flow:
 import asyncio
 import concurrent.futures
 import json
-import os
 import logging
 from typing import Dict, Any, List, Optional, Union
 
@@ -179,10 +178,16 @@ async def _summarize_session(
                 return None
 
 
+# Sources that are excluded from session browsing/searching by default.
+# Third-party integrations (Paperclip agents, etc.) tag their sessions with
+# HERMES_SESSION_SOURCE=tool so they don't clutter the user's session history.
+_HIDDEN_SESSION_SOURCES = ("tool",)
+
+
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
-        sessions = db.list_sessions_rich(limit=limit + 5)  # fetch extra to skip current
+        sessions = db.list_sessions_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
 
         # Resolve current session lineage to exclude it
         current_root = None
@@ -266,6 +271,7 @@ def session_search(
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=50,  # Get more matches to find unique sessions
             offset=0,
         )
@@ -359,12 +365,14 @@ def session_search(
             return await asyncio.gather(*coros, return_exceptions=True)
 
         try:
-            asyncio.get_running_loop()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                results = pool.submit(lambda: asyncio.run(_summarize_all())).result(timeout=60)
-        except RuntimeError:
-            # No event loop running, create a new one
-            results = asyncio.run(_summarize_all())
+            # Use _run_async() which properly manages event loops across
+            # CLI, gateway, and worker-thread contexts.  The previous
+            # pattern (asyncio.run() in a ThreadPoolExecutor) created a
+            # disposable event loop that conflicted with cached
+            # AsyncOpenAI/httpx clients bound to a different loop,
+            # causing deadlocks in gateway mode (#2681).
+            from model_tools import _run_async
+            results = _run_async(_summarize_all())
         except concurrent.futures.TimeoutError:
             logging.warning(
                 "Session summarization timed out after 60 seconds",

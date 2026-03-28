@@ -47,12 +47,37 @@ from hermes_cli.default_soul import DEFAULT_SOUL_MD
 
 
 # =============================================================================
+# Managed mode (NixOS declarative config)
+# =============================================================================
+
+def is_managed() -> bool:
+    """Check if hermes is running in Nix-managed mode.
+
+    Two signals: the HERMES_MANAGED env var (set by the systemd service),
+    or a .managed marker file in HERMES_HOME (set by the NixOS activation
+    script, so interactive shells also see it).
+    """
+    if os.getenv("HERMES_MANAGED", "").lower() in ("true", "1", "yes"):
+        return True
+    managed_marker = get_hermes_home() / ".managed"
+    return managed_marker.exists()
+
+def managed_error(action: str = "modify configuration"):
+    """Print user-friendly error for managed mode."""
+    print(
+        f"Cannot {action}: configuration is managed by NixOS (HERMES_MANAGED=true).\n"
+        "Edit services.hermes-agent.settings in your configuration.nix and run:\n"
+        "  sudo nixos-rebuild switch",
+        file=sys.stderr,
+    )
+
+
+# =============================================================================
 # Config paths
 # =============================================================================
 
-def get_hermes_home() -> Path:
-    """Get the Hermes home directory (~/.hermes)."""
-    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+# Re-export from hermes_constants — canonical definition lives there.
+from hermes_constants import get_hermes_home  # noqa: F811,E402
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -239,11 +264,13 @@ DEFAULT_CONFIG = {
         "compact": False,
         "personality": "kawaii",
         "resume_display": "full",
+        "busy_input_mode": "interrupt",
         "bell_on_complete": False,
         "show_reasoning": False,
         "streaming": False,
         "show_cost": False,       # Show $ cost in the status bar (off by default)
         "skin": "default",
+        "tool_progress_command": False,  # Enable /verbose command in messaging gateway
     },
 
     # Privacy settings
@@ -317,6 +344,35 @@ DEFAULT_CONFIG = {
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
+        "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
+                               # independent of the parent's max_iterations)
+        "max_depth": 2,
+        "memory_access": "none",
+        "checkpoint": {
+            "enabled": False,
+            "interval_iterations": 10,
+            "db_path": "",
+        },
+        "retry": {
+            "max_retries": 0,
+            "inject_failure_context": True,
+        },
+        "verify": {
+            "enabled": False,
+            "model": "",
+        },
+        "dag": {
+            "enabled": False,
+        },
+        "blackboard": {
+            "enabled": False,
+        },
+        "semantic_cache": {
+            "enabled": False,
+        },
+        "observability": {
+            "detailed_trace": False,
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -1340,6 +1396,9 @@ _COMMENTED_SECTIONS = """
 
 def save_config(config: Dict[str, Any]):
     """Save configuration to ~/.hermes/config.yaml."""
+    if is_managed():
+        managed_error("save configuration")
+        return
     from utils import atomic_yaml_write
 
     ensure_hermes_home()
@@ -1481,6 +1540,9 @@ def sanitize_env_file() -> int:
 
 def save_env_value(key: str, value: str):
     """Save or update a value in ~/.hermes/.env."""
+    if is_managed():
+        managed_error(f"set {key}")
+        return
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     value = value.replace("\n", "").replace("\r", "")
@@ -1737,6 +1799,9 @@ def show_config():
 
 def edit_config():
     """Open config file in user's editor."""
+    if is_managed():
+        managed_error("edit configuration")
+        return
     config_path = get_config_path()
     
     # Ensure config exists
@@ -1766,6 +1831,9 @@ def edit_config():
 
 def set_config_value(key: str, value: str):
     """Set a configuration value."""
+    if is_managed():
+        managed_error("set configuration values")
+        return
     # Check if it's an API key (goes to .env)
     api_keys = [
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',

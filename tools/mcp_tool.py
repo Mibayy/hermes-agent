@@ -905,6 +905,28 @@ _mcp_thread: Optional[threading.Thread] = None
 # Protects _mcp_loop, _mcp_thread, and _servers from concurrent access.
 _lock = threading.Lock()
 
+# Thread-local flag: set to True in subagent threads to block workspace-mutating
+# MCP tools (set_project_root, switch_project) that would corrupt shared state.
+_tl = threading.local()
+
+# MCP tool names (after mcp_{server}_ prefix stripping) that mutate global
+# workspace state and must be blocked inside subagent threads.
+_SUBAGENT_BLOCKED_TOOL_NAMES = frozenset({
+    "set_project_root",
+    "switch_project",
+    "reindex",
+})
+
+
+def set_subagent_mcp_guard(active: bool) -> None:
+    """Activate or deactivate the subagent MCP workspace guard for the calling thread.
+
+    Call with active=True from delegate_tool.py before running a child agent,
+    and active=False (or let the thread end) afterwards.  Only affects the
+    calling thread — parent and sibling threads are unaffected.
+    """
+    _tl.subagent_guard = active
+
 
 def _ensure_mcp_loop():
     """Start the background event loop thread if not already running."""
@@ -1010,6 +1032,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Block workspace-mutating tools inside subagent threads.
+        if getattr(_tl, "subagent_guard", False) and tool_name in _SUBAGENT_BLOCKED_TOOL_NAMES:
+            return json.dumps({
+                "error": (
+                    f"'{tool_name}' is blocked inside subagents to prevent shared "
+                    "workspace corruption. Use read-only codebase-index tools instead."
+                )
+            })
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1532,6 +1563,16 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         schema = _convert_mcp_schema(name, mcp_tool)
         tool_name_prefixed = schema["name"]
 
+        # Guard against collisions with built-in (non-MCP) tools.
+        existing_toolset = registry.get_toolset_for_tool(tool_name_prefixed)
+        if existing_toolset and not existing_toolset.startswith("mcp-"):
+            logger.warning(
+                "MCP server '%s': tool '%s' (→ '%s') collides with built-in "
+                "tool in toolset '%s' — skipping to preserve built-in",
+                name, mcp_tool.name, tool_name_prefixed, existing_toolset,
+            )
+            continue
+
         registry.register(
             name=tool_name_prefixed,
             toolset=toolset_name,
@@ -1556,9 +1597,20 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         schema = entry["schema"]
         handler_key = entry["handler_key"]
         handler = _handler_factories[handler_key](name, server.tool_timeout)
+        util_name = schema["name"]
+
+        # Same collision guard for utility tools.
+        existing_toolset = registry.get_toolset_for_tool(util_name)
+        if existing_toolset and not existing_toolset.startswith("mcp-"):
+            logger.warning(
+                "MCP server '%s': utility tool '%s' collides with built-in "
+                "tool in toolset '%s' — skipping to preserve built-in",
+                name, util_name, existing_toolset,
+            )
+            continue
 
         registry.register(
-            name=schema["name"],
+            name=util_name,
             toolset=toolset_name,
             schema=schema,
             handler=handler,
@@ -1566,7 +1618,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             is_async=False,
             description=schema["description"],
         )
-        registered_names.append(schema["name"])
+        registered_names.append(util_name)
 
     server._registered_tool_names = list(registered_names)
 

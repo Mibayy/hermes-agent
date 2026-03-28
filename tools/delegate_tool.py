@@ -20,9 +20,21 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import threading
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+
+try:
+    from tools.structured_memory import db as _sm_db_check  # noqa: F401
+    _SM_AVAILABLE = True
+except ImportError:
+    _SM_AVAILABLE = False
+
+from tools.delegate_blackboard import Blackboard
+from tools.delegate_dag import topological_sort, resolve_deps
+from tools.mcp_tool import set_subagent_mcp_guard
 
 
 # Tools that children must never have access to
@@ -35,8 +47,14 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
 ])
 
 MAX_CONCURRENT_CHILDREN = 3
-MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+MAX_DEPTH = 2  # default fallback when config is absent
 DEFAULT_MAX_ITERATIONS = 50
+
+
+def _get_max_depth() -> int:
+    """Read max delegation depth from config, default MAX_DEPTH."""
+    cfg = _load_config()
+    return int(cfg.get('delegation', {}).get('max_depth', MAX_DEPTH))
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
 
@@ -45,15 +63,99 @@ def check_delegate_requirements() -> bool:
     return True
 
 
-def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
+def _load_skill_content(name: str) -> str | None:
+    search_bases = [
+        Path(__file__).parent.parent / 'skills',
+        Path.home() / '.hermes' / 'skills',
+    ]
+    for base in search_bases:
+        if not base.exists():
+            continue
+        for skill_md in base.rglob(f'{name}/SKILL.md'):
+            try:
+                return skill_md.read_text(encoding='utf-8')
+            except OSError:
+                pass
+    logger.debug("Skill '%s' not found in search paths: %s", name, [str(b) for b in search_bases])
+    return None
+
+
+def _format_structured_context(context: Union[str, Dict[str, Any]]) -> str:
+    """
+    Format a context value for injection into a child system prompt.
+
+    Accepts either a plain string or a typed dict with any of:
+      files: list[str]      -- file paths relevant to the task
+      facts: list[str]      -- factual statements about the codebase/domain
+      constraints: list[str] -- hard constraints the subagent must respect
+      notes: str            -- freeform additional context
+
+    Any unrecognised key is rendered as-is under its name.
+    """
+    if isinstance(context, str):
+        return context.strip()
+
+    if not isinstance(context, dict):
+        return str(context).strip()
+
+    sections: list[str] = []
+
+    if 'files' in context and context['files']:
+        files = context['files']
+        sections.append('Relevant files:\n' + '\n'.join(f'  - {f}' for f in files))
+
+    if 'facts' in context and context['facts']:
+        facts = context['facts']
+        sections.append('Known facts:\n' + '\n'.join(f'  - {f}' for f in facts))
+
+    if 'constraints' in context and context['constraints']:
+        constraints = context['constraints']
+        sections.append('Constraints (must be respected):\n' + '\n'.join(f'  - {c}' for c in constraints))
+
+    if 'notes' in context and context['notes']:
+        sections.append(f"Notes:\n{context['notes']}")
+
+    # Render any other keys verbatim
+    known = {'files', 'facts', 'constraints', 'notes'}
+    for key, val in context.items():
+        if key in known:
+            continue
+        header = key.replace('_', ' ').title()
+        if isinstance(val, list):
+            sections.append(f'{header}:\n' + '\n'.join(f'  - {v}' for v in val))
+        else:
+            sections.append(f'{header}:\n{val}')
+
+    return '\n\n'.join(sections)
+
+
+def _build_child_system_prompt(
+    goal: str,
+    context: Union[str, Dict[str, Any], None] = None,
+    skills: list | None = None,
+    blackboard: 'Blackboard | None' = None,
+    hot_facts: Optional[str] = None,
+) -> str:
     """Build a focused system prompt for a child agent."""
     parts = [
         "You are a focused subagent working on a specific delegated task.",
         "",
         f"YOUR TASK:\n{goal}",
     ]
-    if context and context.strip():
-        parts.append(f"\nCONTEXT:\n{context}")
+    if hot_facts and hot_facts.strip():
+        parts.append(f"\nPARENT MEMORY (read-only, do not modify):\n{hot_facts}")
+    if context is not None:
+        formatted = _format_structured_context(context)
+        if formatted:
+            parts.append(f"\nCONTEXT:\n{formatted}")
+    if skills:
+        skill_sections = []
+        for skill_name in skills:
+            content = _load_skill_content(skill_name)
+            if content:
+                skill_sections.append(f'\n--- Skill: {skill_name} ---\n{content}')
+        if skill_sections:
+            parts.append('\nLoaded skills:' + ''.join(skill_sections))
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -64,15 +166,29 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    if blackboard and blackboard.snapshot():
+        parts.append(blackboard.to_context_string())
     return "\n".join(parts)
 
 
+_ALWAYS_BLOCKED_TOOLSETS = {'delegation', 'clarify', 'code_execution'}
+
+
+def _compute_child_toolsets(toolsets: list, memory_mode: str = 'none') -> list:
+    """
+    Filter toolsets for a child agent.
+    memory_mode: none | read | read-write
+    'memory' toolset is stripped unless mode is read/read-write AND _SM_AVAILABLE.
+    """
+    blocked = set(_ALWAYS_BLOCKED_TOOLSETS)
+    if memory_mode == 'none' or not _SM_AVAILABLE:
+        blocked.add('memory')
+    return [t for t in toolsets if t not in blocked]
+
+
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that contain only blocked tools."""
-    blocked_toolset_names = {
-        "delegation", "clarify", "memory", "code_execution",
-    }
-    return [t for t in toolsets if t not in blocked_toolset_names]
+    """Remove toolsets that contain only blocked tools. Backward-compat wrapper."""
+    return _compute_child_toolsets(toolsets, 'none')
 
 
 def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
@@ -160,6 +276,9 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    memory_mode: str = 'none',
+    skills: list | None = None,
+    blackboard: 'Blackboard | None' = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -171,18 +290,20 @@ def _build_child_agent(
     model on OpenRouter while the parent runs on Nous Portal).
     """
     from run_agent import AIAgent
-    import model_tools
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
+    parent_toolsets = set(getattr(parent_agent, "enabled_toolsets", None) or DEFAULT_TOOLSETS)
     if toolsets:
-        child_toolsets = _strip_blocked_tools(toolsets)
+        # Intersect with parent — subagent must not gain tools the parent lacks
+        child_toolsets = _compute_child_toolsets([t for t in toolsets if t in parent_toolsets], memory_mode)
     elif parent_agent and getattr(parent_agent, "enabled_toolsets", None):
-        child_toolsets = _strip_blocked_tools(parent_agent.enabled_toolsets)
+        child_toolsets = _compute_child_toolsets(parent_agent.enabled_toolsets, memory_mode)
     else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+        child_toolsets = _compute_child_toolsets(DEFAULT_TOOLSETS, memory_mode)
 
-    child_prompt = _build_child_system_prompt(goal, context)
+    hot_facts = _get_parent_hot_facts(parent_agent) if memory_mode in ('read', 'read-write') else None
+    child_prompt = _build_child_system_prompt(goal, context, skills=skills, blackboard=blackboard, hot_facts=hot_facts)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -191,9 +312,10 @@ def _build_child_agent(
     # Build progress callback to relay tool calls to parent display
     child_progress_cb = _build_child_progress_callback(task_index, parent_agent)
 
-    # Share the parent's iteration budget so subagent tool calls
-    # count toward the session-wide limit.
-    shared_budget = getattr(parent_agent, "iteration_budget", None)
+    # Each subagent gets its own iteration budget capped at max_iterations
+    # (configurable via delegation.max_iterations, default 50).  This means
+    # total iterations across parent + subagents can exceed the parent's
+    # max_iterations.  The user controls the per-subagent cap in config.yaml.
 
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
@@ -222,7 +344,7 @@ def _build_child_agent(
         log_prefix=f"[subagent-{task_index}]",
         platform=parent_agent.platform,
         skip_context_files=True,
-        skip_memory=True,
+        skip_memory=(memory_mode == 'none'),  # read/read-write: init memory so tools function
         clarify_callback=None,
         session_db=getattr(parent_agent, '_session_db', None),
         providers_allowed=parent_agent.providers_allowed,
@@ -230,7 +352,7 @@ def _build_child_agent(
         providers_order=parent_agent.providers_order,
         provider_sort=parent_agent.provider_sort,
         tool_progress_callback=child_progress_cb,
-        iteration_budget=shared_budget,
+        iteration_budget=None,  # fresh budget per subagent
     )
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
@@ -269,6 +391,9 @@ def _run_single_child(
                                 list(model_tools._last_resolved_tool_names))
 
     try:
+        # Activate MCP workspace guard: blocks set_project_root / switch_project
+        # / reindex for this thread so subagents cannot corrupt the shared index.
+        set_subagent_mcp_guard(True)
         result = child.run_conversation(user_message=goal)
 
         # Flush any remaining batched progress to gateway
@@ -375,6 +500,9 @@ def _run_single_child(
         }
 
     finally:
+        # Deactivate MCP workspace guard for this thread.
+        set_subagent_mcp_guard(False)
+
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -395,6 +523,243 @@ def _run_single_child(
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 
+# ---------------------------------------------------------------------------
+# Semantic dedup cache (graceful no-op without structured memory)
+# ---------------------------------------------------------------------------
+
+def _get_parent_hot_facts(parent_agent) -> Optional[str]:
+    """
+    Extract hot facts from the parent agent's memory store.
+    Returns a formatted string for injection into the child system prompt,
+    or None if memory is not loaded / structured memory unavailable.
+    """
+    store = getattr(parent_agent, '_memory_store', None)
+    if store is None:
+        return None
+    try:
+        parts = []
+        mem_block = store.format_for_system_prompt('memory')
+        if mem_block:
+            parts.append(mem_block)
+        user_block = store.format_for_system_prompt('user')
+        if user_block:
+            parts.append(user_block)
+        return '\n'.join(parts) if parts else None
+    except Exception:
+        return None
+
+
+def _sm_search_goal(goal: str, limit: int = 3) -> list:
+    """Search structured memory for facts matching this goal. Returns [] if unavailable."""
+    if not _SM_AVAILABLE:
+        return []
+    try:
+        from tools.structured_memory.facts import search
+        return search(goal[:60], limit=limit)
+    except Exception:
+        return []
+
+
+def _check_semantic_cache(goal: str) -> Optional[str]:
+    """
+    Look for a recent cached result for a similar goal in structured memory.
+    Returns the cached summary string, or None if no hit.
+    """
+    hits = _sm_search_goal(goal, limit=3)
+    if not hits:
+        return None
+    return hits[0].get('value')
+
+
+# ---------------------------------------------------------------------------
+# Detailed observability trace
+# ---------------------------------------------------------------------------
+
+def _build_detailed_trace(
+    messages: Optional[list],
+    tool_timing: Optional[Dict[str, Any]] = None,
+) -> list:
+    """
+    Build an enriched trace from conversation messages.
+    tool_timing: optional dict mapping tool_call_id -> (start, end) monotonic times.
+    Returns list of trace entries with tool name, bytes, status, and optional duration_ms.
+    """
+    trace: list = []
+    trace_by_id: Dict[str, Dict[str, Any]] = {}
+
+    for msg in (messages or []):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get('role') == 'assistant':
+            for tc in (msg.get('tool_calls') or []):
+                fn = tc.get('function', {})
+                tc_id = tc.get('id', '')
+                entry: Dict[str, Any] = {
+                    'tool': fn.get('name', 'unknown'),
+                    'args_bytes': len(fn.get('arguments', '')),
+                }
+                if tool_timing and tc_id in tool_timing:
+                    start, end = tool_timing[tc_id]
+                    entry['duration_ms'] = round((end - start) * 1000)
+                trace.append(entry)
+                if tc_id:
+                    trace_by_id[tc_id] = entry
+        elif msg.get('role') == 'tool':
+            content = msg.get('content', '') or ''
+            is_error = 'error' in content[:80].lower()
+            result_meta = {
+                'result_bytes': len(content),
+                'status': 'error' if is_error else 'ok',
+            }
+            tc_id = msg.get('tool_call_id')
+            target = trace_by_id.get(tc_id) if tc_id else (trace[-1] if trace else None)
+            if target is not None:
+                target.update(result_meta)
+    return trace
+
+
+# ---------------------------------------------------------------------------
+# Generator-critic loop
+# ---------------------------------------------------------------------------
+
+_CRITIC_MAX_SUMMARY_CHARS = 4000
+
+_CRITIC_PROMPT_TEMPLATE = (
+    "You are a critical reviewer. A subagent was given this goal:\n\n"
+    "GOAL: {goal}\n\n"
+    "It produced this result:\n{summary}\n\n"
+    "Review the result. Respond with exactly one of:\n"
+    "VERDICT: valid   -- result is correct and complete\n"
+    "VERDICT: invalid -- result has errors, missing cases, or logic flaws\n\n"
+    "Then explain your reasoning in 2-5 sentences. Be concise and specific."
+)
+
+
+def _run_with_verify(
+    generator_result: Dict[str, Any],
+    task: Dict[str, Any],
+    parent_agent,
+    cfg: dict,
+) -> Dict[str, Any]:
+    """
+    Optionally run a critic subagent after the generator.
+    Activated when task has verify=True or delegation.verify.enabled=True.
+    Attaches 'verdict' and 'critic_summary' to the result dict.
+    Gracefully skips if generator did not complete or has no summary.
+    """
+    verify_cfg = cfg.get('delegation', {}).get('verify', {})
+    should_verify = task.get('verify', verify_cfg.get('enabled', False))
+
+    if not should_verify or generator_result.get('status') != 'completed':
+        return generator_result
+
+    summary = generator_result.get('summary', '')
+    if not summary:
+        return generator_result
+
+    critic_goal = _CRITIC_PROMPT_TEMPLATE.format(
+        goal=task.get('goal', ''),
+        summary=summary[:_CRITIC_MAX_SUMMARY_CHARS],
+    )
+
+    critic_model = verify_cfg.get('model') or None
+    task_index = generator_result.get('task_index', 0)
+
+    try:
+        critic_child = _build_child_agent(
+            task_index=task_index,
+            goal=critic_goal,
+            context=None,
+            toolsets=[],  # critic only reads a summary string -- no tools needed
+            model=critic_model,
+            max_iterations=10,
+            parent_agent=parent_agent,
+        )
+        critic_result = _run_single_child(
+            task_index=task_index,
+            goal=critic_goal,
+            child=critic_child,
+            parent_agent=parent_agent,
+        )
+    except Exception as e:
+        logger.debug('Critic subagent failed: %s', e)
+        return generator_result
+
+    critic_summary = critic_result.get('summary', '') or ''
+    if 'VERDICT: valid' in critic_summary:
+        verdict = 'valid'
+    elif 'VERDICT: invalid' in critic_summary:
+        verdict = 'invalid'
+    else:
+        verdict = 'unknown'
+
+    return {
+        **generator_result,
+        'verdict': verdict,
+        'critic_summary': critic_summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Intelligent retry with failure context injection
+# ---------------------------------------------------------------------------
+
+_RETRY_CONTEXT_TEMPLATE = (
+    "PREVIOUS ATTEMPT FAILED.\n\n"
+    "Error: {error}\n\n"
+    "Previous attempt summary: {summary}\n\n"
+    "Please try a different approach. Do not repeat the same mistake."
+)
+
+
+def _run_with_retry(
+    task: Dict[str, Any],
+    parent_agent,
+    child_builder_kwargs: Dict[str, Any],
+    max_retries: int = 0,
+    inject_failure_context: bool = True,
+) -> Dict[str, Any]:
+    """
+    Run a task with intelligent retry on failure.
+    On each retry, injects failure context from the previous attempt.
+    """
+    task_index = child_builder_kwargs.get('task_index', 0)
+    last_result: Optional[Dict[str, Any]] = None
+    current_task = dict(task)
+
+    for attempt in range(max_retries + 1):
+        if attempt > 0 and inject_failure_context and last_result:
+            failure_ctx = _RETRY_CONTEXT_TEMPLATE.format(
+                error=last_result.get('error', 'unknown error'),
+                summary=last_result.get('summary') or 'no summary available',
+            )
+            existing = current_task.get('context') or ''
+            current_task = dict(current_task)
+            current_task['context'] = f"{existing}\n\n{failure_ctx}".strip() if existing else failure_ctx
+
+        kwargs = dict(child_builder_kwargs)
+        kwargs['goal'] = current_task['goal']
+        kwargs['context'] = current_task.get('context')
+        child = _build_child_agent(**kwargs)
+        result = _run_single_child(
+            task_index=task_index,
+            goal=current_task['goal'],
+            child=child,
+            parent_agent=parent_agent,
+        )
+        last_result = result
+
+        if result.get('status') == 'completed':
+            if attempt > 0:
+                result = dict(result)
+                result['retry_count'] = attempt
+            return result
+
+    last_result = dict(last_result)  # type: ignore[arg-type]
+    last_result['retry_count'] = max_retries
+    return last_result
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -402,6 +767,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     parent_agent=None,
+    on_task_done=None,   # callable(task_index, result_dict) | None -- fired immediately when each task completes
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -417,10 +783,11 @@ def delegate_task(
 
     # Depth limit
     depth = getattr(parent_agent, '_delegate_depth', 0)
-    if depth >= MAX_DEPTH:
+    max_depth = _get_max_depth()
+    if depth >= max_depth:
         return json.dumps({
             "error": (
-                f"Delegation depth limit reached ({MAX_DEPTH}). "
+                f"Delegation depth limit reached ({max_depth}). "
                 "Subagents cannot spawn further subagents."
             )
         })
@@ -429,6 +796,19 @@ def delegate_task(
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
+    memory_mode = cfg.get('delegation', {}).get('memory_access', 'none')
+
+    # Blackboard: shared key-value store for sibling subagents in this batch
+    deleg_cfg = cfg.get('delegation', {})
+    bb = Blackboard() if deleg_cfg.get('blackboard', {}).get('enabled', False) else None
+
+    # DAG: topological sort when dag.enabled=True
+    dag_enabled = deleg_cfg.get('dag', {}).get('enabled', False)
+
+    # Retry config
+    retry_cfg = deleg_cfg.get('retry', {})
+    max_retries = int(retry_cfg.get('max_retries', 0))
+    inject_failure_context = bool(retry_cfg.get('inject_failure_context', True))
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -451,6 +831,13 @@ def delegate_task(
     if not task_list:
         return json.dumps({"error": "No tasks provided."})
 
+    # DAG sort (only when enabled -- no-op otherwise)
+    if dag_enabled and len(task_list) > 1:
+        try:
+            task_list = topological_sort(task_list)
+        except ValueError as exc:
+            return json.dumps({"error": f"DAG error: {exc}"})
+
     # Validate each task has a goal
     for i, task in enumerate(task_list):
         if not task.get("goal", "").strip():
@@ -458,6 +845,8 @@ def delegate_task(
 
     overall_start = time.monotonic()
     results = []
+    _results_lock = threading.Lock()
+    _completed_by_id: Dict[str, Dict[str, Any]] = {}  # thread-safe completed results for DAG
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -482,6 +871,9 @@ def delegate_task(
                 override_provider=creds["provider"], override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
+                memory_mode=memory_mode,
+                skills=t.get("skills"),
+                blackboard=bb,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -490,11 +882,76 @@ def delegate_task(
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
+    # Shared builder kwargs template (task-specific fields overridden per task)
+    _base_builder_kwargs = dict(
+        goal='',  # overridden per task
+        context=None,
+        toolsets=toolsets,
+        model=creds["model"],
+        max_iterations=effective_max_iter,
+        parent_agent=parent_agent,
+        override_provider=creds["provider"],
+        override_base_url=creds["base_url"],
+        override_api_key=creds["api_key"],
+        override_api_mode=creds["api_mode"],
+        memory_mode=memory_mode,
+        skills=None,
+        blackboard=bb,  # same Blackboard instance shared by all siblings; None when disabled
+    )
+
+    def _run_task(i: int, t: dict) -> Dict[str, Any]:
+        """Run a single task with retry + verify."""
+        # DAG: inject predecessor summaries if dag enabled.
+        # Use _completed_by_id (protected by _results_lock) instead of reading
+        # the shared `results` list directly -- avoids a race condition in the
+        # ThreadPoolExecutor batch path where concurrent tasks could see
+        # partially-written list state.
+        resolved_task = t
+        if dag_enabled:
+            with _results_lock:
+                completed_so_far = dict(_completed_by_id)
+            resolved_task = resolve_deps(t, completed_so_far)
+
+        task_kwargs = dict(_base_builder_kwargs)
+        task_kwargs['task_index'] = i
+        task_kwargs['toolsets'] = t.get('toolsets') or toolsets
+        task_kwargs['skills'] = t.get('skills')
+
+        if False:  # retry disabled
+            result = _run_with_retry(
+                task=resolved_task,
+                parent_agent=parent_agent,
+                child_builder_kwargs=task_kwargs,
+                max_retries=max_retries,
+                inject_failure_context=inject_failure_context,
+            )
+        else:
+            task_kwargs['goal'] = resolved_task['goal']
+            task_kwargs['context'] = resolved_task.get('context')
+            child = _build_child_agent(**task_kwargs)
+            child._delegate_saved_tool_names = _parent_tool_names
+            result = _run_single_child(i, resolved_task['goal'], child, parent_agent)
+
+        # Generator-critic: run verify if requested
+        # result = _run_with_verify(result, t, parent_agent, cfg)
+        return result
+
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        if False:  # retry disabled (teknium feedback #3387)
+            result = _run_task(0, _t)
+        else:
+            result = _run_single_child(0, _t["goal"], child, parent_agent)
+            # result = _run_with_verify(result, _t, parent_agent, cfg)
+        with _results_lock:
+            _completed_by_id[str(result.get('task_index', 0))] = result
         results.append(result)
+        if callable(on_task_done):
+            try:
+                on_task_done(result['task_index'], result)
+            except Exception as e:
+                logger.debug('on_task_done callback raised: %s', e)
     else:
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
@@ -503,29 +960,42 @@ def delegate_task(
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
             futures = {}
             for i, t, child in children:
-                future = executor.submit(
-                    _run_single_child,
-                    task_index=i,
-                    goal=t["goal"],
-                    child=child,
-                    parent_agent=parent_agent,
-                )
-                futures[future] = i
+                if False:  # retry disabled
+                    future = executor.submit(_run_task, i, t)
+                else:
+                    future = executor.submit(
+                        _run_single_child,
+                        task_index=i,
+                        goal=t["goal"],
+                        child=child,
+                        parent_agent=parent_agent,
+                    )
+                futures[future] = (i, t)
 
             for future in as_completed(futures):
+                _fi, _ft = futures[future]
                 try:
                     entry = future.result()
+                    if max_retries == 0:
+                        # entry = _run_with_verify(entry, _ft, parent_agent, cfg)
+                        pass
                 except Exception as exc:
-                    idx = futures[future]
                     entry = {
-                        "task_index": idx,
+                        "task_index": _fi,
                         "status": "error",
                         "summary": None,
                         "error": str(exc),
                         "api_calls": 0,
                         "duration_seconds": 0,
                     }
+                with _results_lock:
+                    _completed_by_id[str(entry.get('task_index', _fi))] = entry
                 results.append(entry)
+                if callable(on_task_done):
+                    try:
+                        on_task_done(entry['task_index'], entry)
+                    except Exception as e:
+                        logger.debug('on_task_done callback raised: %s', e)
                 completed_count += 1
 
                 # Print per-task completion line above the spinner
@@ -703,7 +1173,10 @@ DELEGATE_TASK_SCHEMA = {
         "- Subagents CANNOT call: delegate_task, clarify, memory, send_message, "
         "execute_code.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
-        "- Results are always returned as an array, one entry per task."
+        "- Results are always returned as an array, one entry per task.\n\n"
+        "V2 TASK FIELDS (opt-in):\n"
+        "- skills: list of skill names to inject into child system prompt\n"
+        "- id: string identifier used by depends_on"
     ),
     "parameters": {
         "type": "object",
