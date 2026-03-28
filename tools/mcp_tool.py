@@ -905,6 +905,28 @@ _mcp_thread: Optional[threading.Thread] = None
 # Protects _mcp_loop, _mcp_thread, and _servers from concurrent access.
 _lock = threading.Lock()
 
+# Thread-local flag: set to True in subagent threads to block workspace-mutating
+# MCP tools (set_project_root, switch_project) that would corrupt shared state.
+_tl = threading.local()
+
+# MCP tool names (after mcp_{server}_ prefix stripping) that mutate global
+# workspace state and must be blocked inside subagent threads.
+_SUBAGENT_BLOCKED_TOOL_NAMES = frozenset({
+    "set_project_root",
+    "switch_project",
+    "reindex",
+})
+
+
+def set_subagent_mcp_guard(active: bool) -> None:
+    """Activate or deactivate the subagent MCP workspace guard for the calling thread.
+
+    Call with active=True from delegate_tool.py before running a child agent,
+    and active=False (or let the thread end) afterwards.  Only affects the
+    calling thread — parent and sibling threads are unaffected.
+    """
+    _tl.subagent_guard = active
+
 
 def _ensure_mcp_loop():
     """Start the background event loop thread if not already running."""
@@ -1010,6 +1032,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Block workspace-mutating tools inside subagent threads.
+        if getattr(_tl, "subagent_guard", False) and tool_name in _SUBAGENT_BLOCKED_TOOL_NAMES:
+            return json.dumps({
+                "error": (
+                    f"'{tool_name}' is blocked inside subagents to prevent shared "
+                    "workspace corruption. Use read-only codebase-index tools instead."
+                )
+            })
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
