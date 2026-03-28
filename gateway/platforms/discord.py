@@ -1413,15 +1413,28 @@ class DiscordAdapter(BasePlatformAdapter):
         command_text: str,
         followup_msg: str | None = None,
     ) -> None:
-        """Common handler for simple slash commands that dispatch a command string."""
+        """Common handler for simple slash commands that dispatch a command string.
+
+        Defers the interaction first to show a "thinking..." indicator, then
+        dispatches the command.  Once the command has been handled, the deferred
+        response is resolved so Discord removes the "thinking..." indicator:
+        - If ``followup_msg`` is provided it replaces the deferred placeholder.
+        - Otherwise the deferred placeholder is deleted so it doesn't linger.
+        """
         await interaction.response.defer(ephemeral=True)
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)
-        if followup_msg:
-            try:
-                await interaction.followup.send(followup_msg, ephemeral=True)
-            except Exception as e:
-                logger.debug("Discord followup failed: %s", e)
+        try:
+            if followup_msg:
+                # Edit the original deferred response instead of sending a new
+                # followup — this replaces the "thinking..." indicator cleanly.
+                await interaction.edit_original_response(content=followup_msg)
+            else:
+                # No confirmation message needed: delete the deferred placeholder
+                # so the "thinking..." indicator disappears from the chat.
+                await interaction.delete_original_response()
+        except Exception as e:
+            logger.debug("Discord deferred response cleanup failed: %s", e)
 
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
