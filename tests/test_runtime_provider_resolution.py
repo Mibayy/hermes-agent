@@ -103,6 +103,82 @@ def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
     assert resolved["base_url"] == "https://custom.example/v1"
 
 
+def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
+    """provider:auto + base_url:localhost should NOT route to Anthropic even if
+    ANTHROPIC_API_KEY is set in the environment. Regression test for #3846.
+
+    Users running Ollama locally had requests silently sent to Anthropic's API
+    because resolve_provider("auto") picked up ANTHROPIC_API_KEY before the
+    config.yaml base_url was checked.
+    """
+    # ANTHROPIC_API_KEY is present in environment — should be ignored
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "default": "ollama/minimax-m2.7:cloud",
+            "provider": "auto",
+            "base_url": "http://localhost:11434",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider()
+
+    # Must NOT go to Anthropic's API
+    assert "anthropic.com" not in resolved.get("base_url", ""), (
+        f"Expected custom endpoint, got Anthropic: {resolved}"
+    )
+    assert resolved["base_url"] == "http://localhost:11434"
+    # provider should be custom/openrouter (OpenAI-compat), not anthropic
+    assert resolved["provider"] != "anthropic", (
+        f"Should have routed to custom endpoint, not anthropic: {resolved}"
+    )
+
+
+def test_auto_provider_with_known_cloud_base_url_still_uses_anthropic(monkeypatch):
+    """provider:auto + base_url pointing to Anthropic should still use Anthropic.
+
+    The bypass only applies to non-cloud endpoints.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "auto",
+            "base_url": "https://api.anthropic.com",
+        },
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    # Mock the anthropic token resolver
+    import hermes_cli.runtime_provider as rp_mod
+    monkeypatch.setattr(
+        rp_mod,
+        "resolve_runtime_provider",
+        lambda **kw: {
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-fake-key",
+            "source": "env",
+            "requested_provider": "auto",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider()
+    assert resolved["provider"] == "anthropic"
+    assert "anthropic.com" in resolved["base_url"]
+
+
 def test_openrouter_key_takes_priority_over_openai_key(monkeypatch):
     """OPENROUTER_API_KEY should be used over OPENAI_API_KEY when both are set.
 
