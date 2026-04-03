@@ -1040,7 +1040,7 @@ def convert_messages_to_anthropic(
 
     for m in messages:
         role = m.get("role", "user")
-        content = m.get("content", "")
+        content = m.get("content") or ""
 
         if role == "system":
             if isinstance(content, list):
@@ -1174,8 +1174,8 @@ def convert_messages_to_anthropic(
         if fixed and fixed[-1]["role"] == m["role"]:
             if m["role"] == "user":
                 # Merge consecutive user messages
-                prev_content = fixed[-1]["content"]
-                curr_content = m["content"]
+                prev_content = fixed[-1]["content"] or ""
+                curr_content = m["content"] or ""
                 if isinstance(prev_content, str) and isinstance(curr_content, str):
                     fixed[-1]["content"] = prev_content + "\n" + curr_content
                 elif isinstance(prev_content, list) and isinstance(curr_content, list):
@@ -1189,8 +1189,8 @@ def convert_messages_to_anthropic(
                     fixed[-1]["content"] = prev_content + curr_content
             else:
                 # Consecutive assistant messages — merge text content
-                prev_blocks = fixed[-1]["content"]
-                curr_blocks = m["content"]
+                prev_blocks = fixed[-1]["content"] or ""
+                curr_blocks = m["content"] or ""
                 if isinstance(prev_blocks, list) and isinstance(curr_blocks, list):
                     fixed[-1]["content"] = prev_blocks + curr_blocks
                 elif isinstance(prev_blocks, str) and isinstance(curr_blocks, str):
