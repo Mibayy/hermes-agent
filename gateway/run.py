@@ -1923,7 +1923,10 @@ class GatewayRunner:
 
         if canonical == "provider":
             return await self._handle_provider_command(event)
-        
+
+        if canonical == "model":
+            return await self._handle_model_command(event)
+
         if canonical == "personality":
             return await self._handle_personality_command(event)
 
@@ -3283,7 +3286,99 @@ class GatewayRunner:
         lines.append("Switch: `/model provider:model-name`")
         lines.append("Setup: `hermes setup`")
         return "\n".join(lines)
-    
+
+    async def _handle_model_command(self, event: MessageEvent) -> str:
+        """Handle /model — show or change the active model."""
+        import yaml
+
+        args = event.get_command_args().strip() if hasattr(event, 'get_command_args') else ""
+        if not args:
+            # Extract args from raw text fallback
+            text = event.text or ""
+            parts = text.split(maxsplit=1)
+            args = parts[1].strip() if len(parts) > 1 else ""
+
+        # Read current state from config.yaml
+        config_path = _hermes_home / "config.yaml"
+        cfg = {}
+        try:
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+        except Exception:
+            pass
+
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, str):
+            model_cfg = {"default": model_cfg}
+        current_model = model_cfg.get("default") or model_cfg.get("model") or ""
+        current_provider = model_cfg.get("provider", "openrouter")
+        current_base_url = model_cfg.get("base_url", "")
+
+        if not args:
+            from hermes_cli.models import _PROVIDER_LABELS
+            provider_label = _PROVIDER_LABELS.get(current_provider, current_provider)
+            lines = [
+                f"**Model:** `{current_model}`",
+                f"**Provider:** {provider_label} (`{current_provider}`)",
+            ]
+            if current_base_url:
+                lines.append(f"**Endpoint:** `{current_base_url}`")
+            lines.append("")
+            lines.append("Change: `/model provider:model-name`")
+            return "\n".join(lines)
+
+        # Handle bare "/model custom"
+        if args.lower() == "custom":
+            from hermes_cli.model_switch import switch_to_custom_provider
+            result = switch_to_custom_provider()
+            if not result.success:
+                return f"❌ {result.error_message}"
+            model_cfg["default"] = result.model
+            model_cfg["provider"] = "custom"
+            model_cfg["base_url"] = result.base_url
+            cfg["model"] = model_cfg
+            config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+            session_key = self._session_key_for_source(event.source)
+            self._evict_cached_agent(session_key)
+            return (
+                f"✅ Switched to custom endpoint\n"
+                f"**Model:** `{result.model}`\n"
+                f"**Endpoint:** `{result.base_url}`"
+            )
+
+        from hermes_cli.model_switch import switch_model
+
+        result = switch_model(
+            raw_input=args,
+            current_provider=current_provider,
+            current_base_url=current_base_url,
+        )
+
+        if not result.success:
+            return f"❌ {result.error_message}"
+
+        # Persist to config.yaml
+        if result.persist:
+            model_cfg["default"] = result.new_model
+            if result.provider_changed:
+                model_cfg["provider"] = result.target_provider
+                if result.base_url:
+                    model_cfg["base_url"] = result.base_url
+            cfg["model"] = model_cfg
+            config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+
+        # Evict cached agent so next message uses new model
+        session_key = self._session_key_for_source(event.source)
+        self._evict_cached_agent(session_key)
+
+        lines = [f"✅ **Model:** `{result.new_model}`"]
+        if result.provider_changed:
+            lines.append(f"**Provider:** {result.provider_label} (`{result.target_provider}`)")
+        if result.warning_message:
+            lines.append(f"⚠️ {result.warning_message}")
+        return "\n".join(lines)
+
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
         import yaml

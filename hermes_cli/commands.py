@@ -102,6 +102,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[name]"),
     CommandDef("voice", "Toggle voice mode", "Configuration",
                args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
+    CommandDef("model", "Show or change the active model", "Configuration",
+               args_hint="[provider:]model-name"),
 
     # Tools & Skills
     CommandDef("tools", "Manage tools: /tools [list|disable|enable] [name...]", "Tools & Skills",
