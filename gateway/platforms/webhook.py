@@ -76,8 +76,11 @@ class WebhookAdapter(BasePlatformAdapter):
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
 
-        # Delivery info keyed by session chat_id — consumed by send()
+        # Delivery info keyed by session chat_id — looked up by send(),
+        # cleaned up via TTL to avoid unbounded memory growth.
         self._delivery_info: Dict[str, dict] = {}
+        self._delivery_info_ts: Dict[str, float] = {}  # creation timestamps
+        self._delivery_ttl: float = 3600.0  # 1 hour
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -160,11 +163,19 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Deliver the agent's response to the configured destination.
 
-        chat_id is ``webhook:{route}:{delivery_id}`` — we pop the delivery
-        info stored during webhook receipt so it doesn't leak memory.
+        chat_id is ``webhook:{route}:{delivery_id}`` — we look up the
+        delivery info stored during webhook receipt.  Stale entries are
+        pruned via TTL to prevent memory leaks.
         """
-        delivery = self._delivery_info.pop(chat_id, {})
+        # Use .get() instead of .pop() — send() is called for every
+        # intermediate response (tool calls) AND the final response.
+        # Popping on the first call loses delivery config for subsequent
+        # calls, causing the final response to fall back to "log". (#4835)
+        delivery = self._delivery_info.get(chat_id, {})
         deliver_type = delivery.get("deliver", "log")
+
+        # Lazily prune stale delivery entries (older than TTL)
+        self._prune_stale_delivery_info()
 
         if deliver_type == "log":
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
@@ -189,6 +200,17 @@ class WebhookAdapter(BasePlatformAdapter):
         return SendResult(
             success=False, error=f"Unknown deliver type: {deliver_type}"
         )
+
+    def _prune_stale_delivery_info(self) -> None:
+        """Remove delivery entries older than TTL to prevent memory leaks."""
+        now = time.time()
+        stale = [
+            k for k, ts in self._delivery_info_ts.items()
+            if now - ts > self._delivery_ttl
+        ]
+        for k in stale:
+            self._delivery_info.pop(k, None)
+            self._delivery_info_ts.pop(k, None)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
@@ -384,7 +406,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
-        # Store delivery info for send() — consumed (popped) on delivery
+        # Store delivery info for send() — looked up (not popped) on delivery
         deliver_config = {
             "deliver": route_config.get("deliver", "log"),
             "deliver_extra": self._render_delivery_extra(
@@ -393,6 +415,7 @@ class WebhookAdapter(BasePlatformAdapter):
             "payload": payload,
         }
         self._delivery_info[session_chat_id] = deliver_config
+        self._delivery_info_ts[session_chat_id] = time.time()
 
         # Build source and event
         source = self.build_source(
