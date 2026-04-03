@@ -182,6 +182,8 @@ if _config_path.exists():
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "max_turns" in _agent_cfg:
                 os.environ["HERMES_MAX_ITERATIONS"] = str(_agent_cfg["max_turns"])
+            if "gateway_timeout" in _agent_cfg and "HERMES_AGENT_TIMEOUT" not in os.environ:
+                os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         # HERMES_TIMEZONE from .env takes precedence (already in os.environ).
         _tz_cfg = _cfg.get("timezone", "")
@@ -5402,9 +5404,14 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
-        
+
+        # Activity tracker for inactivity-based timeout (#4815).
+        # Updated by tool_progress and step callbacks.
+        _last_activity = [time.time()]
+
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
             """Callback invoked by agent when a tool is called."""
+            _last_activity[0] = time.time()
             if not progress_queue:
                 return
             
@@ -5585,6 +5592,7 @@ class GatewayRunner:
         _hooks_ref = self.hooks
 
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
+            _last_activity[0] = time.time()
             try:
                 # prev_tools may be list[str] or list[dict] with "name"/"result"
                 # keys.  Normalise to keep "tool_names" backward-compatible for
@@ -5752,7 +5760,20 @@ class GatewayRunner:
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-            agent.stream_delta_callback = _stream_delta_cb
+            # Wrap stream delta to update activity tracker (#4815).
+            # Throttled: update at most every 2s to avoid overhead per token.
+            if _stream_delta_cb:
+                _orig_delta_cb = _stream_delta_cb
+                _delta_activity_ts = [0.0]
+                def _activity_stream_delta_cb(*args, **kwargs):
+                    now = time.time()
+                    if now - _delta_activity_ts[0] > 2.0:
+                        _last_activity[0] = now
+                        _delta_activity_ts[0] = now
+                    return _orig_delta_cb(*args, **kwargs)
+                agent.stream_delta_callback = _activity_stream_delta_cb
+            else:
+                agent.stream_delta_callback = None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
 
@@ -6088,38 +6109,61 @@ class GatewayRunner:
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
         
         try:
-            # Run in thread pool to not block.  Cap total execution time
-            # so a hung API call or runaway tool doesn't permanently lock
-            # the session.  Default 10 minutes; override with env var.
+            # Run in thread pool to not block.  Use an *inactivity*-based
+            # timeout instead of a wall-clock limit so long-running but
+            # active tasks (subagents, reasoning models) aren't killed.
+            # Only triggers when the agent has produced no tool calls or
+            # iteration completions for the configured duration.  (#4815)
+            #
+            # Config: agent.gateway_timeout in config.yaml, or
+            # HERMES_AGENT_TIMEOUT env var.  0 = unlimited.
             _agent_timeout = float(os.getenv("HERMES_AGENT_TIMEOUT", 600))
             loop = asyncio.get_event_loop()
-            try:
-                response = await asyncio.wait_for(
-                    loop.run_in_executor(None, run_sync),
-                    timeout=_agent_timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    "Agent execution timed out after %.0fs for session %s",
-                    _agent_timeout, session_key,
-                )
-                # Interrupt the agent if it's still running so the thread
-                # pool worker is freed.
-                _timed_out_agent = agent_holder[0]
-                if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
-                    _timed_out_agent.interrupt("Execution timed out")
-                response = {
-                    "final_response": (
-                        f"⏱️ Request timed out after {int(_agent_timeout // 60)} minutes. "
-                        "The agent may have been stuck on a tool or API call.\n"
-                        "Try again, or use /reset to start fresh."
-                    ),
-                    "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
-                    "api_calls": 0,
-                    "tools": tools_holder[0] or [],
-                    "history_offset": 0,
-                    "failed": True,
-                }
+            _executor_future = loop.run_in_executor(None, run_sync)
+
+            if _agent_timeout <= 0:
+                # Unlimited — just await the result
+                response = await _executor_future
+            else:
+                # Poll for inactivity: check every 5s whether the agent
+                # has been idle (no tool/step callback) for longer than
+                # the configured timeout.
+                _poll_interval = 5.0
+                response = None
+                while True:
+                    try:
+                        response = await asyncio.wait_for(
+                            asyncio.shield(_executor_future),
+                            timeout=_poll_interval,
+                        )
+                        break  # Agent finished normally
+                    except asyncio.TimeoutError:
+                        # Agent still running — check inactivity
+                        idle_secs = time.time() - _last_activity[0]
+                        if idle_secs >= _agent_timeout:
+                            logger.error(
+                                "Agent idle for %.0fs (timeout %.0fs) in session %s",
+                                idle_secs, _agent_timeout, session_key,
+                            )
+                            _timed_out_agent = agent_holder[0]
+                            if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
+                                _timed_out_agent.interrupt("Execution timed out")
+                            _timeout_mins = int(_agent_timeout // 60) or 1
+                            response = {
+                                "final_response": (
+                                    f"⏱️ Agent inactive for {_timeout_mins} min "
+                                    "(no tool calls or API responses). "
+                                    "It may have been stuck on a hung API call.\n"
+                                    "Try again, or use /reset to start fresh."
+                                ),
+                                "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
+                                "api_calls": 0,
+                                "tools": tools_holder[0] or [],
+                                "history_offset": 0,
+                                "failed": True,
+                            }
+                            break
+                        # else: still active, keep waiting
 
             # Track fallback model state: if the agent switched to a
             # fallback model during this run, persist it so /model shows
